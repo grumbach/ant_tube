@@ -1,0 +1,184 @@
+name: Release on Main Commit
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  linux-release:
+    if: contains(github.event.head_commit.message, '[release]')
+    name: Build Linux targets
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools musl-dev
+          rustup target add ${{ matrix.target }}
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          cargo install cross
+
+      - name: Clone autonomi dependency
+        run: |
+          git clone https://github.com/maidsafe/autonomi.git
+          cd autonomi
+          git checkout main
+          cd ..
+
+      - name: Build x86_64
+        uses: actions-rs/cargo@v1
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+
+      - name: Build ARM
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          cd target/${{ matrix.target }}/release
+          zip Antube-${{ matrix.target }}.zip antube
+          cd ../../..
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/Antube-${{ matrix.target }}.zip
+
+  macos-release:
+    if: contains(github.event.head_commit.message, '[release]')
+    name: Build MacOS targets
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Clone autonomi dependency
+        run: |
+          git clone https://github.com/maidsafe/autonomi.git
+          cd autonomi
+          git checkout main
+          cd ..
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+
+      - name: Set executable permissions
+        run: |
+          chmod +x target/${{ matrix.target }}/release/antube
+
+      - name: Create .app bundle
+        run: |
+          chmod +x ./assets/mac_os_bundle.sh
+          BINARY_PATH="./target/${{ matrix.target }}/release/antube" ./assets/mac_os_bundle.sh
+          ditto -c -k --keepParent Antube.app Antube-${{ matrix.target }}.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: Antube-${{ matrix.target }}.zip
+
+  create-release:
+    name: Create Release
+    needs: [linux-release, macos-release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # This fetches all history and tags
+
+      - name: Download all workflow run artifacts
+        uses: actions/download-artifact@v4
+
+      - name: List files
+        run: |
+          pwd
+          ls -R
+
+      - name: Generate release tag
+        id: tag
+        run: |
+          # Get the latest tag, default to v0.1.0 if none exists
+          git fetch --tags
+          latest_tag=$(git tag -l 'v*' | sort -V | tail -n 1)
+          if [ -z "$latest_tag" ]; then
+            latest_tag="v0.1.0"
+          fi
+          
+          # Remove the 'v' prefix and increment the patch version
+          version=${latest_tag#v}
+          IFS='.' read -r major minor patch <<< "$version"
+          new_patch=$((patch + 1))
+          new_tag="v$major.$minor.$new_patch"
+          
+          echo "tag_name=$new_tag" >> $GITHUB_OUTPUT
+          echo "release_name=Release $new_tag" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tag.outputs.tag_name }}
+          name: ${{ steps.tag.outputs.release_name }}
+          body: |
+            Automated release from main branch
+            
+            Built targets:
+            - Linux (x86_64, aarch64)
+            - MacOS (x86_64, aarch64)
+
+            > Mac users might face quarantine issues: `"Antube.app" is damaged and can't be opened. You should move it to the Trash.`
+            > To fix this:
+            > 1. **Unzip** the file (double-click the `.zip`).
+            > 2. Open **Terminal** (press `Cmd + Space`, type "Terminal", and press Enter).
+            > 3. Go to your Downloads folder:
+            >   ```bash
+            >   cd ~/Downloads
+            >   ```
+            > 4. Remove macOS quarantine flag:
+            >   ```bash
+            >   xattr -rd com.apple.quarantine Antube.app
+            >   ```
+            > 5. Double-click **Antube.app** to open it!
+          draft: false
+          prerelease: false
+          files: |
+            x86_64-unknown-linux-musl/Antube-x86_64-unknown-linux-musl.zip
+            aarch64-unknown-linux-musl/Antube-aarch64-unknown-linux-musl.zip
+            x86_64-apple-darwin/Antube-x86_64-apple-darwin.zip
+            aarch64-apple-darwin/Antube-aarch64-apple-darwin.zip
