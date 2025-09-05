@@ -5,7 +5,7 @@ use server::Server;
 
 use eframe::egui;
 use tokio::sync::mpsc;
-use bytes::Bytes;
+use std::io::Write;
 
 #[derive(Debug, Clone)]
 struct StreamStatus {
@@ -17,7 +17,7 @@ struct StreamStatus {
 
 enum StreamEvent {
     ServerConnected,
-    ChunkReceived { data: Bytes },
+    ChunkReceived { size: usize },
     StreamComplete,
     StreamError { error: String },
 }
@@ -29,9 +29,9 @@ struct AntubeApp {
     is_connecting: bool,
     stream_status: StreamStatus,
     stream_receiver: Option<mpsc::UnboundedReceiver<StreamEvent>>,
-    video_data: Vec<u8>,
     video_temp_path: Option<std::path::PathBuf>,
     is_playing: bool,
+    current_file_size: usize,
 }
 
 impl Default for AntubeApp {
@@ -48,9 +48,9 @@ impl Default for AntubeApp {
                 chunks_received: 0,
             },
             stream_receiver: None,
-            video_data: Vec::new(),
             video_temp_path: None,
             is_playing: false,
+            current_file_size: 0,
         }
     }
 }
@@ -75,10 +75,10 @@ impl eframe::App for AntubeApp {
                         self.is_connecting = false;
                         self.stream_status.is_streaming = true;
                     }
-                    StreamEvent::ChunkReceived { data } => {
+                    StreamEvent::ChunkReceived { size } => {
                         self.stream_status.chunks_received += 1;
-                        self.stream_status.total_bytes_received += data.len();
-                        self.video_data.extend_from_slice(&data);
+                        self.stream_status.total_bytes_received += size;
+                        self.current_file_size += size;
                     }
                     StreamEvent::StreamComplete => {
                         self.stream_status.is_streaming = false;
@@ -125,15 +125,14 @@ impl eframe::App for AntubeApp {
                     ui.add_space(15.0);
                     
                     // Only keep essential action buttons
-                    let download_enabled = !self.video_data.is_empty();
-                    ui.add_enabled_ui(download_enabled, |ui| {
+                    let file_available = self.video_temp_path.is_some() && self.current_file_size > 0;
+                    ui.add_enabled_ui(file_available, |ui| {
                         if ui.small_button("💾").clicked() {
                             self.save_video_data();
                         }
                     });
                     
-                    let play_enabled = !self.video_data.is_empty();
-                    ui.add_enabled_ui(play_enabled, |ui| {
+                    ui.add_enabled_ui(file_available, |ui| {
                         let button_text = if self.is_playing { "⏸" } else { "▶" };
                         if ui.small_button(button_text).clicked() {
                             self.toggle_play_pause();
@@ -147,11 +146,11 @@ impl eframe::App for AntubeApp {
                         ui.label(egui::RichText::new("Connecting...").size(10.0).color(egui::Color32::YELLOW));
                     } else if self.stream_status.is_streaming {
                         ui.add(egui::Spinner::new().size(10.0));
-                        ui.label(egui::RichText::new(format!("{}", self.format_file_size(self.stream_status.total_bytes_received))).size(10.0).color(egui::Color32::GREEN));
+                        ui.label(egui::RichText::new(self.format_file_size(self.stream_status.total_bytes_received).to_string()).size(10.0).color(egui::Color32::GREEN));
                     } else if let Some(_error) = &self.stream_status.error_message {
                         ui.label(egui::RichText::new("Error").size(10.0).color(egui::Color32::RED));
                     } else if self.stream_status.total_bytes_received > 0 {
-                        ui.label(egui::RichText::new(format!("{}", self.format_file_size(self.stream_status.total_bytes_received))).size(10.0).color(egui::Color32::LIGHT_BLUE));
+                        ui.label(egui::RichText::new(self.format_file_size(self.stream_status.total_bytes_received).to_string()).size(10.0).color(egui::Color32::LIGHT_BLUE));
                     }
                     
                     // Auto-focus on startup
@@ -172,8 +171,9 @@ impl eframe::App for AntubeApp {
 
 impl AntubeApp {
     fn connect_and_stream(&mut self) {
-        // Clear previous data and set connecting state
-        self.video_data.clear();
+        // Clear previous state
+        self.current_file_size = 0;
+        self.video_temp_path = None;
         self.is_connecting = true;
         self.stream_status = StreamStatus {
             is_streaming: false,
@@ -181,6 +181,14 @@ impl AntubeApp {
             total_bytes_received: 0,
             chunks_received: 0,
         };
+        
+        // Create temp file for streaming
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("antube_stream_{}.mp4", 
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()));
         
         let address = self.address_input.clone();
         let (server_tx, mut server_rx) = mpsc::unbounded_channel();
@@ -194,6 +202,7 @@ impl AntubeApp {
         
         let (stream_tx, stream_rx) = mpsc::unbounded_channel();
         self.stream_receiver = Some(stream_rx);
+        self.video_temp_path = Some(temp_file.clone());
         
         // Spawn the connection and streaming task
         tokio::spawn(async move {
@@ -202,26 +211,53 @@ impl AntubeApp {
                 Some(Ok(server)) => {
                     let _ = stream_tx.send(StreamEvent::ServerConnected);
                     
-                    // Start streaming
-                    match server.stream_data(&address).await {
-                        Ok(stream) => {
-                            for chunk_result in stream {
-                                match chunk_result {
-                                    Ok(chunk) => {
-                                        if stream_tx.send(StreamEvent::ChunkReceived { data: chunk }).is_err() {
-                                            break;
+                    // Create/open temp file for writing
+                    match std::fs::File::create(&temp_file) {
+                        Ok(mut file) => {
+                            // Start streaming
+                            match server.stream_data(&address).await {
+                                Ok(stream) => {
+                                    for chunk_result in stream {
+                                        match chunk_result {
+                                            Ok(chunk) => {
+                                                // Write chunk directly to temp file
+                                                if let Err(e) = file.write_all(&chunk) {
+                                                    let _ = stream_tx.send(StreamEvent::StreamError { 
+                                                        error: format!("Failed to write to temp file: {e}")
+                                                    });
+                                                    return;
+                                                }
+                                                
+                                                if stream_tx.send(StreamEvent::ChunkReceived { size: chunk.len() }).is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            Err(error) => {
+                                                let _ = stream_tx.send(StreamEvent::StreamError { error });
+                                                return;
+                                            }
                                         }
                                     }
-                                    Err(error) => {
-                                        let _ = stream_tx.send(StreamEvent::StreamError { error });
+                                    
+                                    // Flush and close file
+                                    if let Err(e) = file.flush() {
+                                        let _ = stream_tx.send(StreamEvent::StreamError { 
+                                            error: format!("Failed to flush temp file: {e}")
+                                        });
                                         return;
                                     }
+                                    
+                                    let _ = stream_tx.send(StreamEvent::StreamComplete);
+                                }
+                                Err(error) => {
+                                    let _ = stream_tx.send(StreamEvent::StreamError { error });
                                 }
                             }
-                            let _ = stream_tx.send(StreamEvent::StreamComplete);
                         }
-                        Err(error) => {
-                            let _ = stream_tx.send(StreamEvent::StreamError { error });
+                        Err(e) => {
+                            let _ = stream_tx.send(StreamEvent::StreamError { 
+                                error: format!("Failed to create temp file: {e}")
+                            });
                         }
                     }
                 }
@@ -282,7 +318,7 @@ impl AntubeApp {
                                         .size(16.0));
                                 }
                             });
-                        } else if !self.video_data.is_empty() {
+                        } else if self.video_temp_path.is_some() && self.current_file_size > 0 {
                             ui.vertical_centered(|ui| {
                                 let status_text = if self.is_playing { "▶ Playing" } else { "⏸ Ready to Play" };
                                 ui.label(egui::RichText::new("🎬")
@@ -294,7 +330,7 @@ impl AntubeApp {
                                     .size(28.0));
                                 ui.add_space(10.0);
                                 ui.label(egui::RichText::new(format!("File size: {}", 
-                                    self.format_file_size(self.video_data.len())))
+                                    self.format_file_size(self.current_file_size)))
                                     .color(egui::Color32::GRAY)
                                     .size(18.0));
                             });
@@ -328,11 +364,10 @@ impl AntubeApp {
     }
     
     fn toggle_play_pause(&mut self) {
-        if !self.video_data.is_empty() {
+        if self.video_temp_path.is_some() && self.current_file_size > 0 {
             self.is_playing = !self.is_playing;
             
             if self.is_playing {
-                // Create temp file and play
                 self.play_in_system_player();
             } else {
                 // For now, we can't actually pause system player
@@ -343,25 +378,12 @@ impl AntubeApp {
     }
     
     fn play_in_system_player(&mut self) {
-        if self.video_data.is_empty() {
-            return;
-        }
-        
-        let temp_dir = std::env::temp_dir();
-        let temp_file = temp_dir.join(format!("antube_temp_{}.mp4", 
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()));
-        
-        match std::fs::write(&temp_file, &self.video_data) {
-            Ok(_) => {
-                self.video_temp_path = Some(temp_file.clone());
-                
+        if let Some(temp_file) = &self.video_temp_path {
+            if temp_file.exists() && self.current_file_size > 0 {
                 #[cfg(target_os = "macos")]
                 {
                     let _ = std::process::Command::new("open")
-                        .arg(&temp_file)
+                        .arg(temp_file)
                         .spawn();
                 }
                 
@@ -378,40 +400,44 @@ impl AntubeApp {
                         .arg(&temp_file)
                         .spawn();
                 }
-            }
-            Err(e) => {
-                println!("Failed to create temp file: {}", e);
+            } else {
+                println!("Temp file not found or empty: {temp_file:?}");
             }
         }
     }
     
     fn save_video_data(&self) {
-        if self.video_data.is_empty() {
-            return;
-        }
-        
-        let address_short = if self.address_input.len() > 8 {
-            &self.address_input[..8]
-        } else {
-            &self.address_input
-        };
-        let suggested_filename = format!("antube_{}.mp4", address_short);
-        
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Video Files", &["mp4", "mov", "avi", "mkv", "webm"])
-            .add_filter("All Files", &["*"])
-            .set_file_name(&suggested_filename)
-            .set_title("Save Downloaded Video")
-            .save_file() 
-        {
-            match std::fs::write(&path, &self.video_data) {
-                Ok(_) => {
-                    println!("✅ Video saved to: {}", path.display());
-                }
-                Err(e) => {
-                    println!("❌ Failed to save: {}", e);
+        if let Some(temp_file) = &self.video_temp_path {
+            if !temp_file.exists() || self.current_file_size == 0 {
+                println!("❌ No video data to save");
+                return;
+            }
+            
+            let address_short = if self.address_input.len() > 8 {
+                &self.address_input[..8]
+            } else {
+                &self.address_input
+            };
+            let suggested_filename = format!("antube_{address_short}.mp4");
+            
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Video Files", &["mp4", "mov", "avi", "mkv", "webm"])
+                .add_filter("All Files", &["*"])
+                .set_file_name(&suggested_filename)
+                .set_title("Save Downloaded Video")
+                .save_file() 
+            {
+                match std::fs::copy(temp_file, &path) {
+                    Ok(_) => {
+                        println!("✅ Video saved to: {}", path.display());
+                    }
+                    Err(e) => {
+                        println!("❌ Failed to save: {e}");
+                    }
                 }
             }
+        } else {
+            println!("❌ No video data available to save");
         }
     }
     

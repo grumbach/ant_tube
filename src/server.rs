@@ -20,15 +20,15 @@ impl Server {
     }
 
     pub async fn stream_data(&self, address: &str) -> Result<impl Iterator<Item = Result<Bytes, String>> + use<>, String> {
-        println!("Starting to stream data from address: {}", address);
+        println!("Starting to stream data from address: {address}");
         
         // Parse the address
         let data_address = DataAddress::from_hex(address)
-            .map_err(|e| format!("Invalid address format: {}", e))?;
+            .map_err(|e| format!("Invalid address format: {e}"))?;
         
         // Start streaming
         let stream = self.client.data_stream_public(&data_address).await
-            .map_err(|e| format!("Failed to start streaming: {}", e))?;
+            .map_err(|e| format!("Failed to start streaming: {e}"))?;
             
         // Convert GetError to String for easier error handling
         Ok(stream.map(|chunk_result| {
