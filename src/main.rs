@@ -93,16 +93,18 @@ impl eframe::App for AntubeApp {
             }
         }
 
-        // Main UI
+        // Main UI with scroll area to ensure everything fits
         egui::CentralPanel::default().show(ctx, |ui| {
+            let available_height = ui.available_height();
+            
             ui.vertical_centered(|ui| {
-                ui.add_space(20.0);
+                ui.add_space(10.0);
 
-                // Address input
+                // Address input with controls in one row
                 ui.horizontal(|ui| {
                     ui.label("Address:");
                     let response = ui.add_sized(
-                        [350.0, 25.0],
+                        [300.0, 22.0],
                         egui::TextEdit::singleline(&mut self.address_input)
                             .hint_text("Enter video address...")
                     );
@@ -120,81 +122,49 @@ impl eframe::App for AntubeApp {
                         self.connect_and_stream();
                     }
                     
+                    ui.add_space(15.0);
+                    
+                    // Only keep essential action buttons
+                    let download_enabled = !self.video_data.is_empty();
+                    ui.add_enabled_ui(download_enabled, |ui| {
+                        if ui.small_button("💾").clicked() {
+                            self.save_video_data();
+                        }
+                    });
+                    
+                    let play_enabled = !self.video_data.is_empty();
+                    ui.add_enabled_ui(play_enabled, |ui| {
+                        let button_text = if self.is_playing { "⏸" } else { "▶" };
+                        if ui.small_button(button_text).clicked() {
+                            self.toggle_play_pause();
+                        }
+                    });
+                    
+                    // Show status inline on the same row
+                    ui.add_space(20.0);
+                    if self.is_connecting {
+                        ui.add(egui::Spinner::new().size(10.0));
+                        ui.label(egui::RichText::new("Connecting...").size(10.0).color(egui::Color32::YELLOW));
+                    } else if self.stream_status.is_streaming {
+                        ui.add(egui::Spinner::new().size(10.0));
+                        ui.label(egui::RichText::new(format!("{}", self.format_file_size(self.stream_status.total_bytes_received))).size(10.0).color(egui::Color32::GREEN));
+                    } else if let Some(_error) = &self.stream_status.error_message {
+                        ui.label(egui::RichText::new("Error").size(10.0).color(egui::Color32::RED));
+                    } else if self.stream_status.total_bytes_received > 0 {
+                        ui.label(egui::RichText::new(format!("{}", self.format_file_size(self.stream_status.total_bytes_received))).size(10.0).color(egui::Color32::LIGHT_BLUE));
+                    }
+                    
                     // Auto-focus on startup
                     if self.address_input.is_empty() {
                         response.request_focus();
                     }
                 });
                 
-                ui.add_space(20.0);
+                ui.add_space(5.0);
                 
-                // Player screen
-                self.show_player_screen(ui);
-                
-                ui.add_space(20.0);
-                
-                // Three centered buttons
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::Vec2::new(ui.available_width(), 50.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-                                ui.horizontal(|ui| {
-                                    // Download button
-                                    let download_enabled = !self.video_data.is_empty();
-                                    ui.add_enabled_ui(download_enabled, |ui| {
-                                        if ui.add_sized([120.0, 40.0], egui::Button::new("💾 Download")).clicked() {
-                                            self.save_video_data();
-                                        }
-                                    });
-                                    
-                                    ui.add_space(20.0);
-                                    
-                                    // Copy address button
-                                    let copy_enabled = !self.address_input.trim().is_empty();
-                                    ui.add_enabled_ui(copy_enabled, |ui| {
-                                        if ui.add_sized([120.0, 40.0], egui::Button::new("📋 Copy Address")).clicked() {
-                                            ui.output_mut(|o| o.copied_text = self.address_input.clone());
-                                        }
-                                    });
-                                    
-                                    ui.add_space(20.0);
-                                    
-                                    // Play/Pause button
-                                    let play_enabled = !self.video_data.is_empty();
-                                    ui.add_enabled_ui(play_enabled, |ui| {
-                                        let button_text = if self.is_playing { "⏸ Pause" } else { "▶ Play" };
-                                        if ui.add_sized([120.0, 40.0], egui::Button::new(button_text)).clicked() {
-                                            self.toggle_play_pause();
-                                        }
-                                    });
-                                });
-                            });
-                        }
-                    );
-                });
-                
-                ui.add_space(10.0);
-                
-                // Status info
-                if self.is_connecting {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Connecting to network...");
-                    });
-                } else if self.stream_status.is_streaming {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(format!("Streaming... {} bytes received", self.stream_status.total_bytes_received));
-                    });
-                } else if let Some(error) = &self.stream_status.error_message {
-                    ui.colored_label(egui::Color32::RED, format!("Error: {}", error));
-                } else if self.stream_status.total_bytes_received > 0 {
-                    ui.label(format!("Downloaded {} bytes in {} chunks", 
-                        self.stream_status.total_bytes_received, 
-                        self.stream_status.chunks_received));
-                }
+                // Player screen - maximize to fill remaining space
+                let remaining_height = available_height - 50.0; // Minimal space for top controls
+                self.show_player_screen_full(ui, remaining_height.max(400.0));
             });
         });
     }
@@ -267,32 +237,30 @@ impl AntubeApp {
         });
     }
     
-    fn show_player_screen(&mut self, ui: &mut egui::Ui) {
-        // Create a large black rectangle for the video player
-        let available_size = ui.available_size();
-        let player_size = egui::Vec2::new(
-            (available_size.x - 40.0).min(800.0),
-            ((available_size.x - 40.0).min(800.0) * 9.0 / 16.0).min(450.0)
-        );
+    fn show_player_screen_full(&mut self, ui: &mut egui::Ui, max_height: f32) {
+        // Use all available space - player goes to bottom of window
+        let available_width = ui.available_width();
+        let player_height = max_height;
+        let player_size = egui::Vec2::new(available_width, player_height);
         
         ui.allocate_ui_with_layout(
-            egui::Vec2::new(available_size.x, player_size.y + 20.0),
+            player_size,
             egui::Layout::centered_and_justified(egui::Direction::TopDown),
             |ui| {
                 let (_rect, response) = ui.allocate_exact_size(player_size, egui::Sense::click());
                 
-                // Draw the player background
+                // Draw the player background - fill entire area
                 ui.painter().rect_filled(
                     response.rect,
-                    egui::Rounding::same(8.0),
-                    egui::Color32::from_rgb(20, 20, 20)
+                    egui::Rounding::same(4.0),
+                    egui::Color32::from_rgb(10, 10, 10)
                 );
                 
-                // Draw border
+                // Draw subtle border
                 ui.painter().rect_stroke(
                     response.rect,
-                    egui::Rounding::same(8.0),
-                    egui::Stroke::new(2.0, egui::Color32::from_rgb(60, 60, 60))
+                    egui::Rounding::same(4.0),
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 40))
                 );
                 
                 // Content inside the player
@@ -302,54 +270,55 @@ impl AntubeApp {
                         if self.stream_status.is_streaming {
                             ui.vertical_centered(|ui| {
                                 ui.add(egui::Spinner::new().size(40.0));
-                                ui.add_space(10.0);
+                                ui.add_space(15.0);
                                 ui.label(egui::RichText::new("Streaming video...")
                                     .color(egui::Color32::WHITE)
-                                    .size(18.0));
+                                    .size(24.0));
                                 if self.stream_status.total_bytes_received > 0 {
-                                    ui.label(egui::RichText::new(format!("{} bytes received", 
-                                        self.stream_status.total_bytes_received))
+                                    ui.add_space(5.0);
+                                    ui.label(egui::RichText::new(format!("{} received", 
+                                        self.format_file_size(self.stream_status.total_bytes_received)))
                                         .color(egui::Color32::GRAY)
-                                        .size(14.0));
+                                        .size(16.0));
                                 }
                             });
                         } else if !self.video_data.is_empty() {
                             ui.vertical_centered(|ui| {
-                                let status_text = if self.is_playing { "▶ Playing" } else { "⏸ Ready" };
+                                let status_text = if self.is_playing { "▶ Playing" } else { "⏸ Ready to Play" };
                                 ui.label(egui::RichText::new("🎬")
                                     .color(egui::Color32::WHITE)
-                                    .size(60.0));
-                                ui.add_space(10.0);
+                                    .size(80.0));
+                                ui.add_space(15.0);
                                 ui.label(egui::RichText::new(status_text)
                                     .color(egui::Color32::WHITE)
-                                    .size(20.0));
-                                ui.add_space(5.0);
+                                    .size(28.0));
+                                ui.add_space(10.0);
                                 ui.label(egui::RichText::new(format!("File size: {}", 
                                     self.format_file_size(self.video_data.len())))
                                     .color(egui::Color32::GRAY)
-                                    .size(14.0));
+                                    .size(18.0));
                             });
                         } else if self.is_connecting {
                             ui.vertical_centered(|ui| {
                                 ui.add(egui::Spinner::new().size(30.0));
-                                ui.add_space(10.0);
+                                ui.add_space(15.0);
                                 ui.label(egui::RichText::new("Connecting to network...")
                                     .color(egui::Color32::YELLOW)
-                                    .size(16.0));
+                                    .size(20.0));
                             });
                         } else {
                             ui.vertical_centered(|ui| {
                                 ui.label(egui::RichText::new("📺")
                                     .color(egui::Color32::GRAY)
-                                    .size(60.0));
-                                ui.add_space(10.0);
+                                    .size(80.0));
+                                ui.add_space(15.0);
                                 ui.label(egui::RichText::new("AnTube Player")
                                     .color(egui::Color32::GRAY)
-                                    .size(18.0));
-                                ui.add_space(5.0);
-                                ui.label(egui::RichText::new("Enter an address to start streaming")
+                                    .size(28.0));
+                                ui.add_space(10.0);
+                                ui.label(egui::RichText::new("Enter a video address above to start streaming")
                                     .color(egui::Color32::DARK_GRAY)
-                                    .size(14.0));
+                                    .size(16.0));
                             });
                         }
                     });
