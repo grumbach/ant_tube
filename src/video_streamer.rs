@@ -1,7 +1,7 @@
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub struct StreamError(String);
@@ -30,7 +30,7 @@ pub struct VideoStreamer {
     appsrc: gst_app::AppSrc,
     #[allow(dead_code)]
     pipeline: gst::Pipeline,  // Kept for potential future use
-    is_eos: Arc<Mutex<bool>>,
+    is_eos: AtomicBool,
 }
 
 impl VideoStreamer {
@@ -52,7 +52,7 @@ impl VideoStreamer {
         Ok(Self {
             appsrc,
             pipeline,
-            is_eos: Arc::new(Mutex::new(false)),
+            is_eos: AtomicBool::new(false),
         })
     }
 
@@ -368,13 +368,11 @@ impl VideoStreamer {
     }
 
     fn is_stream_ended(&self) -> bool {
-        self.is_eos.lock().map(|guard| *guard).unwrap_or(false)
+        self.is_eos.load(Ordering::Relaxed)
     }
 
     pub fn signal_end_of_stream(&self) -> Result<(), String> {
-        if let Ok(mut eos_guard) = self.is_eos.lock() {
-            *eos_guard = true;
-        }
+        self.is_eos.store(true, Ordering::Relaxed);
 
         self.appsrc
             .end_of_stream()

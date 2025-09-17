@@ -60,7 +60,7 @@ enum StreamStatus {
 enum StreamEvent {
     ServerConnected { stream_id: StreamId },
     ChunkReceived { stream_id: StreamId, size: usize },
-    StreamComplete { stream_id: StreamId },
+    StreamComplete { stream_id: StreamId, video_streamer: VideoStreamer },
     StreamError { stream_id: StreamId, error: String },
     VideoStreamerReady { stream_id: StreamId },
 }
@@ -69,6 +69,7 @@ struct AntubeApp {
     address_input: String,
     selected_env: String,
     streams: HashMap<StreamId, StreamInfo>,
+    video_streamers: HashMap<StreamId, VideoStreamer>,
     stream_receiver: mpsc::UnboundedReceiver<StreamEvent>,
     stream_sender: mpsc::UnboundedSender<StreamEvent>,
     stream_tasks: HashMap<StreamId, JoinHandle<()>>,
@@ -92,6 +93,7 @@ impl AntubeApp {
             address_input: address,
             selected_env: args.network,
             streams: HashMap::new(),
+            video_streamers: HashMap::new(),
             stream_receiver,
             stream_sender,
             stream_tasks: HashMap::new(),
@@ -171,7 +173,7 @@ impl eframe::App for AntubeApp {
                 StreamEvent::VideoStreamerReady { stream_id } => {
                     println!("Stream {} video streamer ready", stream_id);
                 }
-                StreamEvent::StreamComplete { stream_id } => {
+                StreamEvent::StreamComplete { stream_id, video_streamer } => {
                     if let Some(stream) = self.streams.get_mut(&stream_id) {
                         if let StreamStatus::Streaming {
                             total_bytes_received,
@@ -183,7 +185,9 @@ impl eframe::App for AntubeApp {
                                 total_bytes_received: *total_bytes_received,
                                 chunks_received: *chunks_received,
                             };
-                            println!("Stream {} completed", stream_id);
+                            // Store the VideoStreamer to keep it alive
+                            self.video_streamers.insert(stream_id, video_streamer);
+                            println!("Stream {} completed and VideoStreamer stored", stream_id);
                         }
                     }
                 }
@@ -205,15 +209,11 @@ impl eframe::App for AntubeApp {
             }
         }
 
-        // Note: Removed timeout-based stale stream detection as it caused false positives
-        // Window close detection happens through VideoStreamer.is_stopped() in streaming tasks
-
         for stream_id in finished_tasks {
             println!("Cleaning up finished streaming task {}", stream_id);
             self.stream_tasks.remove(&stream_id);
+            // Note: Keep VideoStreamer alive even after task finishes - user might still be watching
         }
-
-        // Note: Removed stale stream timeout logic - was causing false positives
 
         // Multiple streams UI with scrollable list
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -241,6 +241,11 @@ impl eframe::App for AntubeApp {
                     // Add Stream button
                     if ui.button("Add Stream").clicked() && !self.address_input.trim().is_empty() {
                         self.connect_and_stream();
+                    }
+
+                    // Clear All button
+                    if !self.streams.is_empty() && ui.button("Clear All").clicked() {
+                        self.clear_all_streams();
                     }
 
                     // Auto-focus on startup
@@ -304,20 +309,9 @@ impl AntubeApp {
 
                     // Stream info
                     ui.vertical(|ui| {
-                        // Address (shortened)
-                        let short_address = if stream.address.len() > 20 {
-                            format!(
-                                "{}...{}",
-                                &stream.address[..10],
-                                &stream.address[stream.address.len() - 10..]
-                            )
-                        } else {
-                            stream.address.clone()
-                        };
-
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("#{} {}", stream.id, short_address))
+                                egui::RichText::new(format!("#{} {}", stream.id, stream.address))
                                     .size(12.0)
                                     .strong(),
                             );
@@ -486,12 +480,7 @@ impl AntubeApp {
             None => return,
         };
 
-        let video_streamer = match Self::create_video_streamer(stream_id, &stream_tx) {
-            Some(streamer) => streamer,
-            None => return,
-        };
-
-        Self::stream_video_data(stream_id, server, video_streamer, address, stream_tx).await;
+        Self::stream_video_data(stream_id, server, address, stream_tx).await;
     }
 
     async fn wait_for_server(
@@ -518,29 +507,9 @@ impl AntubeApp {
         }
     }
 
-    fn create_video_streamer(
-        stream_id: StreamId,
-        stream_tx: &mpsc::UnboundedSender<StreamEvent>,
-    ) -> Option<VideoStreamer> {
-        match VideoStreamer::new() {
-            Ok(video_streamer) => {
-                let _ = stream_tx.send(StreamEvent::VideoStreamerReady { stream_id });
-                Some(video_streamer)
-            }
-            Err(e) => {
-                let _ = stream_tx.send(StreamEvent::StreamError {
-                    stream_id,
-                    error: format!("Failed to create video streamer: {e}"),
-                });
-                None
-            }
-        }
-    }
-
     async fn stream_video_data(
         stream_id: StreamId,
         server: Server,
-        _video_streamer: VideoStreamer, // We'll create a new one after prebuffering
         address: String,
         stream_tx: mpsc::UnboundedSender<StreamEvent>,
     ) {
@@ -557,10 +526,9 @@ impl AntubeApp {
                 stream_id,
                 error: e,
             });
-            return;
         }
 
-        let _ = stream_tx.send(StreamEvent::StreamComplete { stream_id });
+        // StreamComplete will be sent from process_stream_with_delayed_pipeline with VideoStreamer
     }
 
     fn process_stream_with_delayed_pipeline(
@@ -653,20 +621,19 @@ impl AntubeApp {
         }
 
         // Signal end of stream and completion
-        if let Some(ref streamer) = video_streamer {
+        if let Some(streamer) = video_streamer {
             println!("All chunks processed, signaling end of stream");
             if let Err(e) = streamer.signal_end_of_stream() {
                 return Err(format!("Failed to signal end of stream: {e}"));
             }
             println!("End of stream signaled successfully");
 
-            // Send completion event to UI immediately
-            let _ = stream_tx.send(StreamEvent::StreamComplete { stream_id });
-            println!("StreamComplete event sent to UI");
-
-            // The VideoStreamer will continue to exist and play
-            // Window close detection will happen through GStreamer bus messages
-            // No need for artificial keep-alive - the VideoStreamer manages its own lifecycle
+            // Send completion event to UI with VideoStreamer to keep it alive
+            let _ = stream_tx.send(StreamEvent::StreamComplete {
+                stream_id,
+                video_streamer: streamer
+            });
+            println!("StreamComplete event sent to UI with VideoStreamer");
         }
 
         Ok(())
@@ -684,6 +651,24 @@ impl AntubeApp {
 
         println!("Successfully pushed chunk to video streamer");
         Ok(())
+    }
+
+    fn clear_all_streams(&mut self) {
+        println!("Clearing all streams and VideoStreamers");
+
+        // Abort all running streaming tasks
+        for (stream_id, task) in self.stream_tasks.drain() {
+            println!("Aborting streaming task for stream {}", stream_id);
+            task.abort();
+        }
+
+        // Clear all streams
+        self.streams.clear();
+
+        // Clear all VideoStreamers - this will stop all GStreamer pipelines
+        self.video_streamers.clear();
+
+        println!("All streams and VideoStreamers cleared");
     }
 
     fn format_data_size(&self, bytes: usize) -> String {
