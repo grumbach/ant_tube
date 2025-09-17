@@ -14,3 +14,7 @@ serde_json = "1.0.132"
 tokio = { version = "1.43.1", features = ["full"] }
 bytes = "1.8.0"
 rfd = "0.15"
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+clap = { version = "4.0", features = ["derive"] }

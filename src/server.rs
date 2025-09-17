@@ -1,5 +1,5 @@
-use autonomi::{Bytes, Client};
 use autonomi::data::DataAddress;
+use autonomi::{Bytes, Client};
 
 pub const ENVIRONMENTS: [&str; 3] = ["local", "autonomi", "alpha"];
 pub const DEFAULT_ENVIRONMENT: &str = "autonomi";
@@ -19,21 +19,25 @@ impl Server {
         Ok(Self { client })
     }
 
-    pub async fn stream_data(&self, address: &str) -> Result<impl Iterator<Item = Result<Bytes, String>> + use<>, String> {
+    pub async fn stream_data(
+        &self,
+        address: &str,
+    ) -> Result<impl Iterator<Item = Result<Bytes, String>> + use<>, String> {
         println!("Starting to stream data from address: {address}");
-        
+
         // Parse the address
-        let data_address = DataAddress::from_hex(address)
-            .map_err(|e| format!("Invalid address format: {e}"))?;
-        
+        let data_address =
+            DataAddress::from_hex(address).map_err(|e| format!("Invalid address format: {e}"))?;
+
         // Start streaming
-        let stream = self.client.data_stream_public(&data_address).await
+        let stream = self
+            .client
+            .data_stream_public(&data_address)
+            .await
             .map_err(|e| format!("Failed to start streaming: {e}"))?;
-            
+
         // Convert GetError to String for easier error handling
-        Ok(stream.map(|chunk_result| {
-            chunk_result.map_err(|e| e.to_string())
-        }))
+        Ok(stream.map(|chunk_result| chunk_result.map_err(|e| e.to_string())))
     }
 }
 
