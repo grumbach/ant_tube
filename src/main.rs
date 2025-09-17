@@ -45,8 +45,10 @@ enum StreamStatus {
     Streaming {
         total_bytes_received: usize,
         chunks_received: usize,
-        streaming_rate: f64,
+        chunks_processed: usize,
+        chunks_in_memory: usize,
         last_update_time: std::time::Instant,
+        total_size: usize,
     },
     Completed {
         total_bytes_received: usize,
@@ -58,7 +60,7 @@ enum StreamStatus {
 }
 
 enum StreamEvent {
-    ServerConnected { stream_id: StreamId },
+    ServerConnected { stream_id: StreamId, total_size: usize },
     ChunkReceived { stream_id: StreamId, size: usize },
     StreamComplete { stream_id: StreamId, video_streamer: VideoStreamer },
     StreamError { stream_id: StreamId, error: String },
@@ -135,15 +137,17 @@ impl eframe::App for AntubeApp {
         // Process stream events
         while let Ok(event) = self.stream_receiver.try_recv() {
             match event {
-                StreamEvent::ServerConnected { stream_id } => {
+                StreamEvent::ServerConnected { stream_id, total_size } => {
                     if let Some(stream) = self.streams.get_mut(&stream_id) {
                         stream.status = StreamStatus::Streaming {
                             total_bytes_received: 0,
                             chunks_received: 0,
-                            streaming_rate: 0.0,
+                            chunks_processed: 0,
+                            chunks_in_memory: 0,
                             last_update_time: std::time::Instant::now(),
+                            total_size,
                         };
-                        println!("Stream {} connected", stream_id);
+                        println!("Stream {} connected, total size: {} bytes", stream_id, total_size);
                     }
                 }
                 StreamEvent::ChunkReceived { stream_id, size } => {
@@ -151,22 +155,27 @@ impl eframe::App for AntubeApp {
                         if let StreamStatus::Streaming {
                             total_bytes_received,
                             chunks_received,
-                            streaming_rate,
+                            chunks_processed,
+                            chunks_in_memory,
                             last_update_time,
+                            total_size: _,
                         } = &mut stream.status
                         {
-                            let now = std::time::Instant::now();
-                            let time_diff = now.duration_since(*last_update_time).as_secs_f64();
-
                             *chunks_received += 1;
                             *total_bytes_received += size;
 
-                            // Calculate streaming rate (bytes per second)
-                            if time_diff > 0.1 {
-                                // Update every 100ms minimum
-                                *streaming_rate = size as f64 / time_diff;
-                                *last_update_time = now;
-                            }
+                            // Estimate chunks processed (assume 1MB chunk size for now)
+                            *chunks_processed = *total_bytes_received / (1024 * 1024);
+
+                            // Estimate chunks in memory (prebuffer + processing pipeline)
+                            // For streaming: keep about 40-50MB in memory (40-50 chunks)
+                            *chunks_in_memory = if *chunks_received <= 45 {
+                                *chunks_received
+                            } else {
+                                45 // Max chunks kept in memory during streaming
+                            };
+
+                            *last_update_time = std::time::Instant::now();
                         }
                     }
                 }
@@ -362,7 +371,9 @@ impl AntubeApp {
             StreamStatus::Streaming {
                 total_bytes_received,
                 chunks_received,
-                streaming_rate,
+                chunks_processed,
+                chunks_in_memory,
+                total_size,
                 ..
             } => {
                 ui.horizontal(|ui| {
@@ -371,25 +382,32 @@ impl AntubeApp {
                             .size(11.0)
                             .color(egui::Color32::GREEN),
                     );
+
+                    // Show progress with total size
+                    let progress_text = format!(
+                        "{}/{} streamed",
+                        self.format_data_size(*total_bytes_received),
+                        self.format_data_size(*total_size)
+                    );
+
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{} • {} chunks",
-                            self.format_data_size(*total_bytes_received),
-                            chunks_received
-                        ))
+                        egui::RichText::new(progress_text)
                         .size(11.0)
                         .color(egui::Color32::WHITE),
                     );
-                    if *streaming_rate > 0.0 {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "• {}/s",
-                                self.format_data_size(*streaming_rate as usize)
-                            ))
-                            .size(11.0)
-                            .color(egui::Color32::GRAY),
-                        );
-                    }
+
+                    // Show detailed chunk processing stats
+                    let chunk_stats_text = format!(
+                        "• {} chunks processed • {} still in memory",
+                        chunks_processed,
+                        chunks_in_memory
+                    );
+
+                    ui.label(
+                        egui::RichText::new(chunk_stats_text)
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                    );
                 });
             }
             StreamStatus::Completed {
@@ -490,7 +508,7 @@ impl AntubeApp {
     ) -> Option<Server> {
         match server_rx.recv().await {
             Some(Ok(server)) => {
-                let _ = stream_tx.send(StreamEvent::ServerConnected { stream_id });
+                // We'll send ServerConnected with total_size from stream_video_data after getting DataStream
                 Some(server)
             }
             Some(Err(error)) => {
@@ -513,7 +531,7 @@ impl AntubeApp {
         address: String,
         stream_tx: mpsc::UnboundedSender<StreamEvent>,
     ) {
-        let stream = match server.stream_data(&address).await {
+        let data_stream = match server.stream_data(&address).await {
             Ok(stream) => stream,
             Err(error) => {
                 let _ = stream_tx.send(StreamEvent::StreamError { stream_id, error });
@@ -521,7 +539,17 @@ impl AntubeApp {
             }
         };
 
-        if let Err(e) = Self::process_stream_with_delayed_pipeline(stream_id, stream, &stream_tx) {
+        // Get total file size from DataStream
+        let total_size = data_stream.data_size() as usize;
+        println!("Total file size: {} bytes ({:.1} MB)", total_size, total_size as f64 / (1024.0 * 1024.0));
+
+        // Send ServerConnected event with total size
+        let _ = stream_tx.send(StreamEvent::ServerConnected { stream_id, total_size });
+
+        // Convert DataStream to iterator for processing
+        let stream_iter = data_stream.map(|chunk_result| chunk_result.map_err(|e| e.to_string()));
+
+        if let Err(e) = Self::process_stream_with_delayed_pipeline(stream_id, stream_iter, total_size, &stream_tx) {
             let _ = stream_tx.send(StreamEvent::StreamError {
                 stream_id,
                 error: e,
@@ -534,6 +562,7 @@ impl AntubeApp {
     fn process_stream_with_delayed_pipeline(
         stream_id: StreamId,
         stream: impl Iterator<Item = Result<bytes::Bytes, String>>,
+        _total_size: usize,
         stream_tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), String> {
         let mut buffer = Vec::new();

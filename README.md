@@ -1,6 +1,6 @@
 # AnTube - Autonomi Video Streamer
 
-A real-time video streaming application using GStreamer for the Autonomi network.
+A real-time video (mp4) streaming application using GStreamer for the Autonomi network.
 
 ## Features
 
