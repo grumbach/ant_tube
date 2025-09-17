@@ -9,7 +9,7 @@
 # If the desired binary path is not provided, the default path will be used
 
 APP_NAME="Antube"
-ICON_PATH="./assets/ant_down.icns"
+ICON_PATH="./assets/antube.icns"
 
 if [ -z "$BINARY_PATH" ]; then
     BINARY_PATH="./target/release/antube"  # this one is the default path

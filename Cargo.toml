@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-autonomi = { path = "../autonomi/autonomi", features = ["loud"] }
+autonomi = { git = "https://github.com/maidsafe/autonomi", features = ["loud"] }
 eframe = "0.24.0"
 egui = "0.24.0"
 image = "0.25.6"

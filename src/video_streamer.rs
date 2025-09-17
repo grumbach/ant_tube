@@ -31,7 +31,6 @@ pub struct VideoStreamer {
     appsrc: gst_app::AppSrc,
     _pipeline: gst::Pipeline,
     chunk_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    max_memory_bytes: usize,
     is_eos: Arc<Mutex<bool>>,
 }
 
@@ -55,7 +54,6 @@ impl VideoStreamer {
             appsrc,
             _pipeline: pipeline,
             chunk_queue: Arc::new(Mutex::new(VecDeque::new())),
-            max_memory_bytes: 50 * 1024 * 1024,
             is_eos: Arc::new(Mutex::new(false)),
         })
     }
@@ -90,7 +88,7 @@ impl VideoStreamer {
         elements: &PipelineElements,
     ) -> Result<(), StreamError> {
         pipeline
-            .add_many(&[
+            .add_many([
                 &elements.appsrc,
                 &elements.decodebin,
                 &elements.videoconvert,
