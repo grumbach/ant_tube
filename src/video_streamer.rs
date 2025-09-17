@@ -1,7 +1,6 @@
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
@@ -30,7 +29,6 @@ struct PipelineElements {
 pub struct VideoStreamer {
     appsrc: gst_app::AppSrc,
     _pipeline: gst::Pipeline,
-    chunk_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     is_eos: Arc<Mutex<bool>>,
 }
 
@@ -53,7 +51,6 @@ impl VideoStreamer {
         Ok(Self {
             appsrc,
             _pipeline: pipeline,
-            chunk_queue: Arc::new(Mutex::new(VecDeque::new())),
             is_eos: Arc::new(Mutex::new(false)),
         })
     }
@@ -63,14 +60,24 @@ impl VideoStreamer {
     }
 
     fn create_pipeline_elements() -> Result<PipelineElements, StreamError> {
-        Ok(PipelineElements {
+        let elements = PipelineElements {
             appsrc: Self::create_element("appsrc", Some("src"))?,
             decodebin: Self::create_element("decodebin", None)?,
             videoconvert: Self::create_element("videoconvert", None)?,
             videosink: Self::create_element("osxvideosink", None)?,
             audioconvert: Self::create_element("audioconvert", None)?,
             audiosink: Self::create_element("autoaudiosink", None)?,
-        })
+        };
+
+        // Set buffer limits on decodebin to prevent memory growth
+        if let Some(decodebin) = elements.decodebin.dynamic_cast_ref::<gst::Element>() {
+            // Set maximum internal queue size to 2MB per stream
+            decodebin.set_property("max-size-bytes", 2 * 1024 * 1024u32);
+            decodebin.set_property("max-size-time", 2_000_000_000u64); // 2 seconds
+            println!("Configured decodebin with memory limits");
+        }
+
+        Ok(elements)
     }
 
     fn create_element(factory_name: &str, name: Option<&str>) -> Result<gst::Element, StreamError> {
@@ -190,10 +197,16 @@ impl VideoStreamer {
 
         appsrc.set_format(gst::Format::Bytes);
         appsrc.set_stream_type(gst_app::AppStreamType::Stream);
-        appsrc.set_max_bytes(50 * 1024 * 1024u64);
+
+        // Set a much smaller buffer limit to prevent memory growth
+        // Only buffer 5MB internally in GStreamer (we already have 40MB prebuffered)
+        appsrc.set_max_bytes(5 * 1024 * 1024u64);
+
+        // Block when the internal queue is full instead of dropping data
+        appsrc.set_block(true);
 
         // Let decodebin auto-detect the format instead of setting caps
-        println!("Configured AppSrc without caps for auto-detection");
+        println!("Configured AppSrc with 5MB buffer limit for memory control");
         Ok(appsrc)
     }
 
@@ -326,10 +339,9 @@ impl VideoStreamer {
     }
 
     pub fn get_memory_usage(&self) -> usize {
-        self.chunk_queue
-            .lock()
-            .map(|queue| queue.iter().map(|c| c.len()).sum())
-            .unwrap_or(0)
+        // Memory is now managed by GStreamer's internal buffer
+        // Return 0 since we don't accumulate chunks anymore
+        0
     }
 }
 

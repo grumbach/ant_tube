@@ -354,135 +354,13 @@ impl AntubeApp {
         let _ = stream_tx.send(StreamEvent::StreamComplete);
     }
 
-    fn process_stream_chunks(
-        stream: impl Iterator<Item = Result<bytes::Bytes, String>>,
-        video_streamer: &VideoStreamer,
-        stream_tx: &mpsc::UnboundedSender<StreamEvent>,
-    ) -> Result<(), String> {
-        let mut buffer = Vec::new();
-        let mut chunk_count = 0;
-        const INITIAL_BUFFER_CHUNKS: usize = 3; // Buffer first 3 chunks for better format detection
-
-        for chunk_result in stream {
-            let chunk = chunk_result?;
-            chunk_count += 1;
-
-            Self::save_chunk_for_testing(&chunk);
-
-            // Buffer initial chunks to give decodebin enough data for format detection
-            if chunk_count <= INITIAL_BUFFER_CHUNKS {
-                buffer.extend_from_slice(&chunk);
-                println!(
-                    "Buffering chunk {} of {} bytes (total buffered: {} bytes)",
-                    chunk_count,
-                    chunk.len(),
-                    buffer.len()
-                );
-
-                // Send the buffered data as one large chunk after collecting initial chunks
-                if chunk_count == INITIAL_BUFFER_CHUNKS {
-                    println!(
-                        "Pushing initial buffer of {} bytes to help format detection",
-                        buffer.len()
-                    );
-                    Self::push_chunk_to_streamer(&buffer, video_streamer)?;
-                    buffer.clear();
-                }
-            } else {
-                // After initial buffering, stream chunks normally
-                Self::push_chunk_to_streamer(&chunk, video_streamer)?;
-            }
-
-            if stream_tx
-                .send(StreamEvent::ChunkReceived { size: chunk.len() })
-                .is_err()
-            {
-                break;
-            }
-        }
-
-        // Handle case where we have less than INITIAL_BUFFER_CHUNKS
-        if !buffer.is_empty() {
-            println!("Pushing remaining buffer of {} bytes", buffer.len());
-            Self::push_chunk_to_streamer(&buffer, video_streamer)?;
-        }
-
-        Ok(())
-    }
-
-    fn process_stream_with_prebuffering(
-        stream: impl Iterator<Item = Result<bytes::Bytes, String>>,
-        video_streamer: &VideoStreamer,
-        stream_tx: &mpsc::UnboundedSender<StreamEvent>,
-    ) -> Result<(), String> {
-        let mut buffer = Vec::new();
-        let mut chunk_count = 0;
-        const PREBUFFER_SIZE: usize = 40 * 1024 * 1024; // 40MB
-        let mut playback_started = false;
-
-        println!(
-            "Starting prebuffering - will collect {}MB before starting playback",
-            PREBUFFER_SIZE / (1024 * 1024)
-        );
-
-        for chunk_result in stream {
-            let chunk = chunk_result?;
-            chunk_count += 1;
-
-            Self::save_chunk_for_testing(&chunk);
-
-            if !playback_started {
-                // Accumulate data until we have enough for reliable format detection
-                buffer.extend_from_slice(&chunk);
-                println!(
-                    "Prebuffering: collected chunk {} ({} bytes), total: {}MB",
-                    chunk_count,
-                    chunk.len(),
-                    buffer.len() / (1024 * 1024)
-                );
-
-                if buffer.len() >= PREBUFFER_SIZE {
-                    println!(
-                        "✅ Prebuffering complete! Starting video playback with {}MB of data",
-                        buffer.len() / (1024 * 1024)
-                    );
-
-                    // Send all buffered data at once
-                    Self::push_chunk_to_streamer(&buffer, video_streamer)?;
-                    playback_started = true;
-                    buffer.clear(); // Free memory
-                }
-            } else {
-                // After prebuffering, stream chunks normally for continuous playback
-                Self::push_chunk_to_streamer(&chunk, video_streamer)?;
-            }
-
-            if stream_tx
-                .send(StreamEvent::ChunkReceived { size: chunk.len() })
-                .is_err()
-            {
-                break;
-            }
-        }
-
-        // Handle case where total file size is less than PREBUFFER_SIZE
-        if !playback_started && !buffer.is_empty() {
-            println!(
-                "File smaller than prebuffer size - starting playback with {}MB",
-                buffer.len() / (1024 * 1024)
-            );
-            Self::push_chunk_to_streamer(&buffer, video_streamer)?;
-        }
-
-        Ok(())
-    }
 
     fn process_stream_with_delayed_pipeline(
         stream: impl Iterator<Item = Result<bytes::Bytes, String>>,
         stream_tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), String> {
         let mut buffer = Vec::new();
-        let mut chunk_count = 0;
+        let mut _chunk_count = 0;
         const PREBUFFER_SIZE: usize = 40 * 1024 * 1024; // 40MB
         let mut video_streamer: Option<VideoStreamer> = None;
         let mut playback_started = false;
@@ -494,19 +372,20 @@ impl AntubeApp {
 
         for chunk_result in stream {
             let chunk = chunk_result?;
-            chunk_count += 1;
+            _chunk_count += 1;
 
-            Self::save_chunk_for_testing(&chunk);
 
             if !playback_started {
                 // First phase: collect data until we have enough for reliable format detection
                 buffer.extend_from_slice(&chunk);
-                println!(
-                    "Prebuffering: collected chunk {} ({} bytes), total: {}MB",
-                    chunk_count,
-                    chunk.len(),
-                    buffer.len() / (1024 * 1024)
-                );
+
+                // Log progress every 10MB to reduce log spam
+                if buffer.len() % (10 * 1024 * 1024) < chunk.len() {
+                    println!(
+                        "Prebuffering progress: {}MB collected",
+                        buffer.len() / (1024 * 1024)
+                    );
+                }
 
                 // Start playback once we hit 40MB OR when we have all the data (whichever comes first)
                 if buffer.len() >= PREBUFFER_SIZE {
@@ -566,38 +445,6 @@ impl AntubeApp {
         Ok(())
     }
 
-    fn save_chunk_for_testing(chunk: &[u8]) {
-        use std::fs::File;
-        use std::io::Write;
-        use std::sync::Mutex;
-
-        static COMPLETE_FILE: Mutex<Option<File>> = Mutex::new(None);
-
-        let mut file_guard = match COMPLETE_FILE.lock() {
-            Ok(guard) => guard,
-            Err(_) => return,
-        };
-
-        if file_guard.is_none() {
-            match File::create("/tmp/antube_complete.mp4") {
-                Ok(file) => {
-                    *file_guard = Some(file);
-                    println!("Created complete MP4 file for testing");
-                }
-                Err(e) => {
-                    println!("Failed to create complete file: {e}");
-                    return;
-                }
-            }
-        }
-
-        if let Some(ref mut file) = *file_guard {
-            if let Err(e) = file.write_all(chunk) {
-                println!("Failed to write chunk to complete file: {e}");
-            }
-            let _ = file.flush();
-        }
-    }
 
     fn push_chunk_to_streamer(chunk: &[u8], video_streamer: &VideoStreamer) -> Result<(), String> {
         println!(
@@ -733,14 +580,6 @@ impl AntubeApp {
         );
     }
 
-    fn toggle_play_pause(&mut self) {
-        // Note: Video playback is now handled automatically by GStreamer
-        // when chunks are pushed to the VideoStreamer
-        if self.video_streamer.is_some() {
-            self.is_playing = !self.is_playing;
-            println!("Video streaming state toggled: {}", self.is_playing);
-        }
-    }
 
     fn format_data_size(&self, bytes: usize) -> String {
         const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
