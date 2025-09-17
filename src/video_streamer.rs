@@ -28,7 +28,8 @@ struct PipelineElements {
 
 pub struct VideoStreamer {
     appsrc: gst_app::AppSrc,
-    _pipeline: gst::Pipeline,
+    #[allow(dead_code)]
+    pipeline: gst::Pipeline,  // Kept for potential future use
     is_eos: Arc<Mutex<bool>>,
 }
 
@@ -50,7 +51,7 @@ impl VideoStreamer {
 
         Ok(Self {
             appsrc,
-            _pipeline: pipeline,
+            pipeline,
             is_eos: Arc::new(Mutex::new(false)),
         })
     }
@@ -64,7 +65,7 @@ impl VideoStreamer {
             appsrc: Self::create_element("appsrc", Some("src"))?,
             decodebin: Self::create_element("decodebin", None)?,
             videoconvert: Self::create_element("videoconvert", None)?,
-            videosink: Self::create_element("osxvideosink", None)?,
+            videosink: Self::create_element("glimagesink", None)?,
             audioconvert: Self::create_element("audioconvert", None)?,
             audiosink: Self::create_element("autoaudiosink", None)?,
         };
@@ -222,7 +223,10 @@ impl VideoStreamer {
         });
     }
 
-    fn handle_bus_message(msg: &gst::Message, pipeline_weak: &gst::glib::WeakRef<gst::Pipeline>) {
+    fn handle_bus_message(
+        msg: &gst::Message,
+        pipeline_weak: &gst::glib::WeakRef<gst::Pipeline>,
+    ) {
         use gst::MessageView;
         match msg.view() {
             MessageView::StateChanged(state_changed) => {
@@ -233,6 +237,10 @@ impl VideoStreamer {
                             state_changed.old(),
                             state_changed.current()
                         );
+
+                        if state_changed.current() == gst::State::Null {
+                            println!("Pipeline went to NULL state");
+                        }
                     }
                 }
 
@@ -248,12 +256,46 @@ impl VideoStreamer {
                             state_changed.current()
                         );
                     }
+
+                    // Monitor video and audio sink state changes for debugging
+                    if element_name.contains("glimagesink") {
+                        println!(
+                            "Video sink {} state: {:?} -> {:?}",
+                            element_name,
+                            state_changed.old(),
+                            state_changed.current()
+                        );
+                    }
+
+                    if element_name.contains("audiosink") {
+                        println!(
+                            "Audio sink {} state: {:?} -> {:?}",
+                            element_name,
+                            state_changed.old(),
+                            state_changed.current()
+                        );
+                    }
                 }
             }
             MessageView::Error(error) => {
                 println!("Pipeline error: {}", error.error());
                 if let Some(debug) = error.debug() {
                     println!("Debug info: {}", debug);
+                }
+
+                // Log critical pipeline element errors for debugging
+                if let Some(element) = msg.src().and_then(|src| src.downcast_ref::<gst::Element>())
+                {
+                    let element_name = element.name();
+                    if element_name.contains("glimagesink")
+                        || element_name.contains("audiosink")
+                        || element_name.contains("decodebin")
+                    {
+                        println!(
+                            "Critical pipeline element error: {}",
+                            element_name
+                        );
+                    }
                 }
             }
             MessageView::Warning(warning) => {
@@ -275,7 +317,9 @@ impl VideoStreamer {
                 // Log specific message types we care about
                 use gst::MessageView;
                 match msg.view() {
-                    MessageView::Element(_) => println!("Element message: {:?}", msg.view()),
+                    MessageView::Element(element_msg) => {
+                        println!("Element message: {:?}", element_msg);
+                    }
                     MessageView::Buffering(_) => println!("Buffering message: {:?}", msg.view()),
                     MessageView::AsyncDone(_) => println!("Async done: {:?}", msg.view()),
                     MessageView::Latency(_) => println!("Latency message: {:?}", msg.view()),
@@ -338,18 +382,10 @@ impl VideoStreamer {
             .map(|_| ())
     }
 
-    pub fn get_memory_usage(&self) -> usize {
-        // Memory is now managed by GStreamer's internal buffer
-        // Return 0 since we don't accumulate chunks anymore
-        0
-    }
 }
 
-impl Drop for VideoStreamer {
-    fn drop(&mut self) {
-        let _ = self._pipeline.set_state(gst::State::Null);
-    }
-}
+// Drop implementation removed to prevent blocking during application shutdown
+// GStreamer will clean up resources automatically when the process exits
 
 #[cfg(test)]
 mod tests {
@@ -413,7 +449,7 @@ mod tests {
         // Let the pipeline process for a bit
         std::thread::sleep(std::time::Duration::from_secs(3));
 
-        println!("Test completed - check if video window appeared");
+        println!("Test completed");
     }
 
     #[test]

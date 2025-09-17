@@ -7,7 +7,9 @@ use video_streamer::VideoStreamer;
 
 use clap::Parser;
 use eframe::egui;
+use std::collections::HashMap;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 #[derive(Parser, Debug)]
 #[command(name = "antube")]
@@ -26,63 +28,74 @@ struct Args {
     test: bool,
 }
 
+type StreamId = u32;
+
 #[derive(Debug, Clone)]
-struct StreamStatus {
-    is_streaming: bool,
-    error_message: Option<String>,
-    total_bytes_received: usize,
-    chunks_received: usize,
+struct StreamInfo {
+    id: StreamId,
+    address: String,
+    environment: String,
+    status: StreamStatus,
+    created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+enum StreamStatus {
+    Connecting,
+    Streaming {
+        total_bytes_received: usize,
+        chunks_received: usize,
+        streaming_rate: f64,
+        last_update_time: std::time::Instant,
+    },
+    Completed {
+        total_bytes_received: usize,
+        chunks_received: usize,
+    },
+    Error {
+        message: String,
+    },
 }
 
 enum StreamEvent {
-    ServerConnected,
-    ChunkReceived { size: usize },
-    StreamComplete,
-    StreamError { error: String },
-    VideoStreamerReady,
+    ServerConnected { stream_id: StreamId },
+    ChunkReceived { stream_id: StreamId, size: usize },
+    StreamComplete { stream_id: StreamId },
+    StreamError { stream_id: StreamId, error: String },
+    VideoStreamerReady { stream_id: StreamId },
 }
 
 struct AntubeApp {
-    server: Option<Server>,
     address_input: String,
     selected_env: String,
-    is_connecting: bool,
-    stream_status: StreamStatus,
-    stream_receiver: Option<mpsc::UnboundedReceiver<StreamEvent>>,
-    video_streamer: Option<VideoStreamer>,
-    is_playing: bool,
-    current_memory_usage: usize,
+    streams: HashMap<StreamId, StreamInfo>,
+    stream_receiver: mpsc::UnboundedReceiver<StreamEvent>,
+    stream_sender: mpsc::UnboundedSender<StreamEvent>,
+    stream_tasks: HashMap<StreamId, JoinHandle<()>>,
+    next_stream_id: StreamId,
 }
 
 impl AntubeApp {
-    fn new(args: Args) -> Self {
+    fn new(mut args: Args) -> Self {
         // Use test address if --test flag is provided
         let address = if args.test {
-            if args.network == "local" {
-                "d8949e2bd7bc0f60d6062510b4f98c9fd92a3bd70567ab9e43f79eb9f8aa24e6".to_string()
-            } else {
-                println!("Warning: --test flag only works with local network");
-                args.address.unwrap_or_default()
-            }
+            args.network = "local".to_string();
+            "d8949e2bd7bc0f60d6062510b4f98c9fd92a3bd70567ab9e43f79eb9f8aa24e6".to_string()
         } else {
             args.address.unwrap_or_default()
         };
 
+        // Create global event channel for all streams
+        let (stream_sender, stream_receiver) = mpsc::unbounded_channel();
+
         let mut app = Self {
-            server: None,
             address_input: address,
             selected_env: args.network,
-            is_connecting: false,
-            stream_status: StreamStatus {
-                is_streaming: false,
-                error_message: None,
-                total_bytes_received: 0,
-                chunks_received: 0,
-            },
-            stream_receiver: None,
-            video_streamer: None,
-            is_playing: false,
-            current_memory_usage: 0,
+            streams: HashMap::new(),
+            stream_receiver,
+            stream_sender,
+            stream_tasks: HashMap::new(),
+            next_stream_id: 1,
         };
 
         // Auto-start streaming if address was provided or test flag used
@@ -106,55 +119,108 @@ impl Default for AntubeApp {
 
 impl eframe::App for AntubeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Request continuous repaints while streaming
-        if self.stream_status.is_streaming || self.is_connecting {
-            ctx.request_repaint();
-        }
-
-        // Initialize server if needed (lazy initialization)
-        if self.server.is_none() && !self.is_connecting && !self.address_input.trim().is_empty() {
-            // Only connect when user actually wants to stream
+        // Request periodic repaints while any stream is active
+        let has_active_streams = self.streams.values().any(|stream| {
+            matches!(
+                stream.status,
+                StreamStatus::Connecting | StreamStatus::Streaming { .. }
+            )
+        });
+        if has_active_streams {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // Process stream events
-        if let Some(receiver) = &mut self.stream_receiver {
-            while let Ok(event) = receiver.try_recv() {
-                match event {
-                    StreamEvent::ServerConnected => {
-                        self.is_connecting = false;
-                        self.stream_status.is_streaming = true;
+        while let Ok(event) = self.stream_receiver.try_recv() {
+            match event {
+                StreamEvent::ServerConnected { stream_id } => {
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        stream.status = StreamStatus::Streaming {
+                            total_bytes_received: 0,
+                            chunks_received: 0,
+                            streaming_rate: 0.0,
+                            last_update_time: std::time::Instant::now(),
+                        };
+                        println!("Stream {} connected", stream_id);
                     }
-                    StreamEvent::ChunkReceived { size } => {
-                        self.stream_status.chunks_received += 1;
-                        self.stream_status.total_bytes_received += size;
-                        if let Some(streamer) = &self.video_streamer {
-                            self.current_memory_usage = streamer.get_memory_usage();
+                }
+                StreamEvent::ChunkReceived { stream_id, size } => {
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        if let StreamStatus::Streaming {
+                            total_bytes_received,
+                            chunks_received,
+                            streaming_rate,
+                            last_update_time,
+                        } = &mut stream.status
+                        {
+                            let now = std::time::Instant::now();
+                            let time_diff = now.duration_since(*last_update_time).as_secs_f64();
+
+                            *chunks_received += 1;
+                            *total_bytes_received += size;
+
+                            // Calculate streaming rate (bytes per second)
+                            if time_diff > 0.1 {
+                                // Update every 100ms minimum
+                                *streaming_rate = size as f64 / time_diff;
+                                *last_update_time = now;
+                            }
                         }
                     }
-                    StreamEvent::VideoStreamerReady => {
-                        self.is_playing = true;
+                }
+                StreamEvent::VideoStreamerReady { stream_id } => {
+                    println!("Stream {} video streamer ready", stream_id);
+                }
+                StreamEvent::StreamComplete { stream_id } => {
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        if let StreamStatus::Streaming {
+                            total_bytes_received,
+                            chunks_received,
+                            ..
+                        } = &stream.status
+                        {
+                            stream.status = StreamStatus::Completed {
+                                total_bytes_received: *total_bytes_received,
+                                chunks_received: *chunks_received,
+                            };
+                            println!("Stream {} completed", stream_id);
+                        }
                     }
-                    StreamEvent::StreamComplete => {
-                        self.stream_status.is_streaming = false;
-                        self.is_connecting = false;
-                    }
-                    StreamEvent::StreamError { error } => {
-                        self.stream_status.is_streaming = false;
-                        self.is_connecting = false;
-                        self.stream_status.error_message = Some(error);
+                }
+                StreamEvent::StreamError { stream_id, error } => {
+                    if let Some(stream) = self.streams.get_mut(&stream_id) {
+                        stream.status = StreamStatus::Error { message: error };
+                        println!("Stream {} error", stream_id);
                     }
                 }
             }
         }
 
-        // Main UI with scroll area to ensure everything fits
-        egui::CentralPanel::default().show(ctx, |ui| {
-            let available_height = ui.available_height();
+        // Clean up completed streaming tasks
+        let mut finished_tasks = Vec::new();
 
-            ui.vertical_centered(|ui| {
+        for (stream_id, task) in &self.stream_tasks {
+            if task.is_finished() {
+                finished_tasks.push(*stream_id);
+            }
+        }
+
+        // Note: Removed timeout-based stale stream detection as it caused false positives
+        // Window close detection happens through VideoStreamer.is_stopped() in streaming tasks
+
+        for stream_id in finished_tasks {
+            println!("Cleaning up finished streaming task {}", stream_id);
+            self.stream_tasks.remove(&stream_id);
+        }
+
+        // Note: Removed stale stream timeout logic - was causing false positives
+
+        // Multiple streams UI with scrollable list
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical(|ui| {
                 ui.add_space(10.0);
 
-                // Address input with controls in one row
+                // Address input with controls - always at top
                 ui.horizontal(|ui| {
                     ui.label("Address:");
                     let response = ui.add_sized(
@@ -172,62 +238,9 @@ impl eframe::App for AntubeApp {
                             }
                         });
 
-                    if ui.button("Stream").clicked() && !self.address_input.trim().is_empty() {
+                    // Add Stream button
+                    if ui.button("Add Stream").clicked() && !self.address_input.trim().is_empty() {
                         self.connect_and_stream();
-                    }
-
-                    ui.add_space(15.0);
-
-                    // Show stream status instead of file controls
-                    if self.is_playing {
-                        let _ = ui.small_button("🎬");
-                        ui.label(
-                            egui::RichText::new("Playing")
-                                .size(10.0)
-                                .color(egui::Color32::GREEN),
-                        );
-                    } else if self.video_streamer.is_some() {
-                        let _ = ui.small_button("📹");
-                        ui.label(
-                            egui::RichText::new("Ready")
-                                .size(10.0)
-                                .color(egui::Color32::BLUE),
-                        );
-                    }
-
-                    // Show status inline on the same row
-                    ui.add_space(20.0);
-                    if self.is_connecting {
-                        ui.add(egui::Spinner::new().size(10.0));
-                        ui.label(
-                            egui::RichText::new("Connecting...")
-                                .size(10.0)
-                                .color(egui::Color32::YELLOW),
-                        );
-                    } else if self.stream_status.is_streaming {
-                        ui.add(egui::Spinner::new().size(10.0));
-                        ui.label(
-                            egui::RichText::new(
-                                self.format_data_size(self.stream_status.total_bytes_received)
-                                    .to_string(),
-                            )
-                            .size(10.0)
-                            .color(egui::Color32::GREEN),
-                        );
-                    } else if let Some(_error) = &self.stream_status.error_message {
-                        ui.label(
-                            egui::RichText::new("Error")
-                                .size(10.0)
-                                .color(egui::Color32::RED),
-                        );
-                    } else if self.stream_status.total_bytes_received > 0 {
-                        let memory_text =
-                            format!("Mem: {}", self.format_data_size(self.current_memory_usage));
-                        ui.label(
-                            egui::RichText::new(memory_text)
-                                .size(10.0)
-                                .color(egui::Color32::LIGHT_BLUE),
-                        );
                     }
 
                     // Auto-focus on startup
@@ -236,78 +249,268 @@ impl eframe::App for AntubeApp {
                     }
                 });
 
-                ui.add_space(5.0);
+                ui.add_space(15.0);
 
-                // Player screen - maximize to fill remaining space
-                let remaining_height = available_height - 50.0; // Minimal space for top controls
-                self.show_player_screen_full(ui, remaining_height.max(400.0));
+                // Streams header
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Streams ({})", self.streams.len()))
+                            .size(16.0)
+                            .strong(),
+                    );
+                });
+
+                ui.add_space(10.0);
+
+                // Scrollable list of streams
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height() - 20.0)
+                    .show(ui, |ui| {
+                        if self.streams.is_empty() {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new("No streams yet. Enter an address above to start streaming.")
+                                        .size(14.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                            });
+                        } else {
+                            // Sort streams by creation time (newest first)
+                            let mut streams: Vec<_> = self.streams.values().collect();
+                            streams.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+                            for stream in streams {
+                                self.show_stream_item(ui, stream);
+                                ui.add_space(8.0);
+                            }
+                        }
+                    });
             });
         });
     }
 }
 
 impl AntubeApp {
+    fn show_stream_item(&self, ui: &mut egui::Ui, stream: &StreamInfo) {
+        egui::Frame::none()
+            .fill(egui::Color32::from_gray(30))
+            .rounding(4.0)
+            .inner_margin(egui::style::Margin::same(8.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // Status indicator
+                    self.show_stream_status_indicator(ui, &stream.status);
+                    ui.add_space(8.0);
+
+                    // Stream info
+                    ui.vertical(|ui| {
+                        // Address (shortened)
+                        let short_address = if stream.address.len() > 20 {
+                            format!(
+                                "{}...{}",
+                                &stream.address[..10],
+                                &stream.address[stream.address.len() - 10..]
+                            )
+                        } else {
+                            stream.address.clone()
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("#{} {}", stream.id, short_address))
+                                    .size(12.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("({})", stream.environment))
+                                    .size(10.0)
+                                    .color(egui::Color32::GRAY),
+                            );
+                        });
+
+                        // Status details
+                        self.show_stream_status_details(ui, &stream.status);
+                    });
+                });
+            });
+    }
+
+    fn show_stream_status_indicator(&self, ui: &mut egui::Ui, status: &StreamStatus) {
+        match status {
+            StreamStatus::Connecting => {
+                ui.add(egui::Spinner::new().size(16.0));
+            }
+            StreamStatus::Streaming { .. } => {
+                ui.add(egui::Spinner::new().size(16.0));
+            }
+            StreamStatus::Completed { .. } => {
+                ui.label(
+                    egui::RichText::new("✅")
+                        .size(16.0)
+                        .color(egui::Color32::WHITE),
+                );
+            }
+            StreamStatus::Error { .. } => {
+                ui.label("⚠️");
+            }
+        }
+    }
+
+    fn show_stream_status_details(&self, ui: &mut egui::Ui, status: &StreamStatus) {
+        match status {
+            StreamStatus::Connecting => {
+                ui.label(
+                    egui::RichText::new("Connecting to network...")
+                        .size(11.0)
+                        .color(egui::Color32::YELLOW),
+                );
+            }
+            StreamStatus::Streaming {
+                total_bytes_received,
+                chunks_received,
+                streaming_rate,
+                ..
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Streaming:")
+                            .size(11.0)
+                            .color(egui::Color32::GREEN),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} • {} chunks",
+                            self.format_data_size(*total_bytes_received),
+                            chunks_received
+                        ))
+                        .size(11.0)
+                        .color(egui::Color32::WHITE),
+                    );
+                    if *streaming_rate > 0.0 {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "• {}/s",
+                                self.format_data_size(*streaming_rate as usize)
+                            ))
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
+                        );
+                    }
+                });
+            }
+            StreamStatus::Completed {
+                total_bytes_received,
+                chunks_received,
+            } => {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Completed:")
+                            .size(11.0)
+                            .color(egui::Color32::GREEN),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} • {} chunks",
+                            self.format_data_size(*total_bytes_received),
+                            chunks_received
+                        ))
+                        .size(11.0)
+                        .color(egui::Color32::WHITE),
+                    );
+                });
+            }
+            StreamStatus::Error { message } => {
+                ui.label(
+                    egui::RichText::new(format!("Error: {}", message))
+                        .size(11.0)
+                        .color(egui::Color32::RED),
+                );
+            }
+        }
+    }
+
     fn connect_and_stream(&mut self) {
-        // Clear previous state
-        self.current_memory_usage = 0;
-        self.video_streamer = None;
-        self.is_connecting = true;
-        self.stream_status = StreamStatus {
-            is_streaming: false,
-            error_message: None,
-            total_bytes_received: 0,
-            chunks_received: 0,
-        };
+        // Create new stream with unique ID
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 1;
 
         let address = self.address_input.clone();
+        let environment = self.selected_env.clone();
+
+        // Create stream info
+        let stream_info = StreamInfo {
+            id: stream_id,
+            address: address.clone(),
+            environment: environment.clone(),
+            status: StreamStatus::Connecting,
+            created_at: std::time::Instant::now(),
+        };
+
+        // Add to streams map
+        self.streams.insert(stream_id, stream_info);
+
+        // Get the shared sender channel
+        let stream_tx = self.stream_sender.clone();
+
         let (server_tx, server_rx) = mpsc::unbounded_channel();
 
         // Spawn server initialization task
-        let env = self.selected_env.clone();
         tokio::spawn(async move {
-            let result = Server::new(&env).await;
+            let result = Server::new(&environment).await;
             let _ = server_tx.send(result);
         });
 
-        let (stream_tx, stream_rx) = mpsc::unbounded_channel();
-        self.stream_receiver = Some(stream_rx);
+        // Start new streaming task and store handle
+        let task = tokio::spawn(Self::run_streaming_task(
+            stream_id, server_rx, stream_tx, address,
+        ));
+        self.stream_tasks.insert(stream_id, task);
 
-        tokio::spawn(Self::run_streaming_task(server_rx, stream_tx, address));
+        println!(
+            "Started stream {} for address {}",
+            stream_id, self.address_input
+        );
+
+        // Clear input for next stream
+        self.address_input.clear();
     }
 
     async fn run_streaming_task(
+        stream_id: StreamId,
         server_rx: mpsc::UnboundedReceiver<Result<Server, String>>,
         stream_tx: mpsc::UnboundedSender<StreamEvent>,
         address: String,
     ) {
-        let server = match Self::wait_for_server(server_rx, &stream_tx).await {
+        let server = match Self::wait_for_server(stream_id, server_rx, &stream_tx).await {
             Some(server) => server,
             None => return,
         };
 
-        let video_streamer = match Self::create_video_streamer(&stream_tx) {
+        let video_streamer = match Self::create_video_streamer(stream_id, &stream_tx) {
             Some(streamer) => streamer,
             None => return,
         };
 
-        Self::stream_video_data(server, video_streamer, address, stream_tx).await;
+        Self::stream_video_data(stream_id, server, video_streamer, address, stream_tx).await;
     }
 
     async fn wait_for_server(
+        stream_id: StreamId,
         mut server_rx: mpsc::UnboundedReceiver<Result<Server, String>>,
         stream_tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> Option<Server> {
         match server_rx.recv().await {
             Some(Ok(server)) => {
-                let _ = stream_tx.send(StreamEvent::ServerConnected);
+                let _ = stream_tx.send(StreamEvent::ServerConnected { stream_id });
                 Some(server)
             }
             Some(Err(error)) => {
-                let _ = stream_tx.send(StreamEvent::StreamError { error });
+                let _ = stream_tx.send(StreamEvent::StreamError { stream_id, error });
                 None
             }
             None => {
                 let _ = stream_tx.send(StreamEvent::StreamError {
+                    stream_id,
                     error: "Server initialization failed".to_string(),
                 });
                 None
@@ -316,15 +519,17 @@ impl AntubeApp {
     }
 
     fn create_video_streamer(
+        stream_id: StreamId,
         stream_tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> Option<VideoStreamer> {
         match VideoStreamer::new() {
             Ok(video_streamer) => {
-                let _ = stream_tx.send(StreamEvent::VideoStreamerReady);
+                let _ = stream_tx.send(StreamEvent::VideoStreamerReady { stream_id });
                 Some(video_streamer)
             }
             Err(e) => {
                 let _ = stream_tx.send(StreamEvent::StreamError {
+                    stream_id,
                     error: format!("Failed to create video streamer: {e}"),
                 });
                 None
@@ -333,6 +538,7 @@ impl AntubeApp {
     }
 
     async fn stream_video_data(
+        stream_id: StreamId,
         server: Server,
         _video_streamer: VideoStreamer, // We'll create a new one after prebuffering
         address: String,
@@ -341,28 +547,32 @@ impl AntubeApp {
         let stream = match server.stream_data(&address).await {
             Ok(stream) => stream,
             Err(error) => {
-                let _ = stream_tx.send(StreamEvent::StreamError { error });
+                let _ = stream_tx.send(StreamEvent::StreamError { stream_id, error });
                 return;
             }
         };
 
-        if let Err(e) = Self::process_stream_with_delayed_pipeline(stream, &stream_tx) {
-            let _ = stream_tx.send(StreamEvent::StreamError { error: e });
+        if let Err(e) = Self::process_stream_with_delayed_pipeline(stream_id, stream, &stream_tx) {
+            let _ = stream_tx.send(StreamEvent::StreamError {
+                stream_id,
+                error: e,
+            });
             return;
         }
 
-        let _ = stream_tx.send(StreamEvent::StreamComplete);
+        let _ = stream_tx.send(StreamEvent::StreamComplete { stream_id });
     }
 
-
     fn process_stream_with_delayed_pipeline(
+        stream_id: StreamId,
         stream: impl Iterator<Item = Result<bytes::Bytes, String>>,
         stream_tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), String> {
         let mut buffer = Vec::new();
-        let mut _chunk_count = 0;
         const PREBUFFER_SIZE: usize = 40 * 1024 * 1024; // 40MB
+
         let mut video_streamer: Option<VideoStreamer> = None;
+
         let mut playback_started = false;
 
         println!(
@@ -372,8 +582,6 @@ impl AntubeApp {
 
         for chunk_result in stream {
             let chunk = chunk_result?;
-            _chunk_count += 1;
-
 
             if !playback_started {
                 // First phase: collect data until we have enough for reliable format detection
@@ -395,8 +603,14 @@ impl AntubeApp {
                     let streamer = VideoStreamer::new()
                         .map_err(|e| format!("Failed to create video streamer: {}", e))?;
 
-                    println!("VideoStreamer created, pushing initial buffer of {}MB", buffer.len() / (1024 * 1024));
+                    println!(
+                        "VideoStreamer created, pushing initial buffer of {}MB",
+                        buffer.len() / (1024 * 1024)
+                    );
                     Self::push_chunk_to_streamer(&buffer, &streamer)?;
+
+                    // Signal that video streamer is ready
+                    let _ = stream_tx.send(StreamEvent::VideoStreamerReady { stream_id });
 
                     video_streamer = Some(streamer);
                     playback_started = true;
@@ -410,7 +624,10 @@ impl AntubeApp {
             }
 
             if stream_tx
-                .send(StreamEvent::ChunkReceived { size: chunk.len() })
+                .send(StreamEvent::ChunkReceived {
+                    stream_id,
+                    size: chunk.len(),
+                })
                 .is_err()
             {
                 break;
@@ -419,17 +636,23 @@ impl AntubeApp {
 
         // Handle case where total file size is less than PREBUFFER_SIZE
         if !playback_started && !buffer.is_empty() {
-            println!("✅ File smaller than 40MB - creating video pipeline with {}MB of data",
-                    buffer.len() / (1024 * 1024));
+            println!(
+                "✅ File smaller than 40MB - creating video pipeline with {}MB of data",
+                buffer.len() / (1024 * 1024)
+            );
 
             let streamer = VideoStreamer::new()
                 .map_err(|e| format!("Failed to create video streamer: {}", e))?;
 
             Self::push_chunk_to_streamer(&buffer, &streamer)?;
+
+            // Signal that video streamer is ready
+            let _ = stream_tx.send(StreamEvent::VideoStreamerReady { stream_id });
+
             video_streamer = Some(streamer);
         }
 
-        // Signal end of stream
+        // Signal end of stream and completion
         if let Some(ref streamer) = video_streamer {
             println!("All chunks processed, signaling end of stream");
             if let Err(e) = streamer.signal_end_of_stream() {
@@ -437,14 +660,17 @@ impl AntubeApp {
             }
             println!("End of stream signaled successfully");
 
-            // Keep the pipeline alive for playback
-            println!("Keeping pipeline alive for playback - press Ctrl+C to exit");
-            std::thread::sleep(std::time::Duration::from_secs(120)); // Keep alive for 2 minutes
+            // Send completion event to UI immediately
+            let _ = stream_tx.send(StreamEvent::StreamComplete { stream_id });
+            println!("StreamComplete event sent to UI");
+
+            // The VideoStreamer will continue to exist and play
+            // Window close detection will happen through GStreamer bus messages
+            // No need for artificial keep-alive - the VideoStreamer manages its own lifecycle
         }
 
         Ok(())
     }
-
 
     fn push_chunk_to_streamer(chunk: &[u8], video_streamer: &VideoStreamer) -> Result<(), String> {
         println!(
@@ -459,127 +685,6 @@ impl AntubeApp {
         println!("Successfully pushed chunk to video streamer");
         Ok(())
     }
-
-    fn show_player_screen_full(&mut self, ui: &mut egui::Ui, max_height: f32) {
-        // Use all available space - player goes to bottom of window
-        let available_width = ui.available_width();
-        let player_height = max_height;
-        let player_size = egui::Vec2::new(available_width, player_height);
-
-        ui.allocate_ui_with_layout(
-            player_size,
-            egui::Layout::centered_and_justified(egui::Direction::TopDown),
-            |ui| {
-                let (_rect, response) = ui.allocate_exact_size(player_size, egui::Sense::click());
-
-                // Draw the player background - fill entire area
-                ui.painter().rect_filled(
-                    response.rect,
-                    egui::Rounding::same(4.0),
-                    egui::Color32::from_rgb(10, 10, 10),
-                );
-
-                // Draw subtle border
-                ui.painter().rect_stroke(
-                    response.rect,
-                    egui::Rounding::same(4.0),
-                    egui::Stroke::new(1.0, egui::Color32::from_rgb(40, 40, 40)),
-                );
-
-                // Content inside the player
-                let content_rect = response.rect.shrink(20.0);
-                ui.allocate_ui_at_rect(content_rect, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        if self.stream_status.is_streaming {
-                            ui.vertical_centered(|ui| {
-                                ui.add(egui::Spinner::new().size(40.0));
-                                ui.add_space(15.0);
-                                ui.label(
-                                    egui::RichText::new("Streaming video...")
-                                        .color(egui::Color32::WHITE)
-                                        .size(24.0),
-                                );
-                                if self.stream_status.total_bytes_received > 0 {
-                                    ui.add_space(5.0);
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} received",
-                                            self.format_data_size(
-                                                self.stream_status.total_bytes_received
-                                            )
-                                        ))
-                                        .color(egui::Color32::GRAY)
-                                        .size(16.0),
-                                    );
-                                }
-                            });
-                        } else if self.video_streamer.is_some() && self.current_memory_usage > 0 {
-                            ui.vertical_centered(|ui| {
-                                let status_text = if self.is_playing {
-                                    "▶ Streaming"
-                                } else {
-                                    "⏸ Ready to Stream"
-                                };
-                                ui.label(
-                                    egui::RichText::new("🎬")
-                                        .color(egui::Color32::WHITE)
-                                        .size(80.0),
-                                );
-                                ui.add_space(15.0);
-                                ui.label(
-                                    egui::RichText::new(status_text)
-                                        .color(egui::Color32::WHITE)
-                                        .size(28.0),
-                                );
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "Memory usage: {}",
-                                        self.format_data_size(self.current_memory_usage)
-                                    ))
-                                    .color(egui::Color32::GRAY)
-                                    .size(18.0),
-                                );
-                            });
-                        } else if self.is_connecting {
-                            ui.vertical_centered(|ui| {
-                                ui.add(egui::Spinner::new().size(30.0));
-                                ui.add_space(15.0);
-                                ui.label(
-                                    egui::RichText::new("Connecting to network...")
-                                        .color(egui::Color32::YELLOW)
-                                        .size(20.0),
-                                );
-                            });
-                        } else {
-                            ui.vertical_centered(|ui| {
-                                ui.label(
-                                    egui::RichText::new("📺")
-                                        .color(egui::Color32::GRAY)
-                                        .size(80.0),
-                                );
-                                ui.add_space(15.0);
-                                ui.label(
-                                    egui::RichText::new("AnTube Player")
-                                        .color(egui::Color32::GRAY)
-                                        .size(28.0),
-                                );
-                                ui.add_space(10.0);
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Enter a video address above to start streaming",
-                                    )
-                                    .color(egui::Color32::DARK_GRAY)
-                                    .size(16.0),
-                                );
-                            });
-                        }
-                    });
-                });
-            },
-        );
-    }
-
 
     fn format_data_size(&self, bytes: usize) -> String {
         const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
