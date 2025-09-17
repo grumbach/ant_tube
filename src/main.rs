@@ -208,7 +208,7 @@ impl eframe::App for AntubeApp {
                         ui.add(egui::Spinner::new().size(10.0));
                         ui.label(
                             egui::RichText::new(
-                                self.format_file_size(self.stream_status.total_bytes_received)
+                                self.format_data_size(self.stream_status.total_bytes_received)
                                     .to_string(),
                             )
                             .size(10.0)
@@ -222,7 +222,7 @@ impl eframe::App for AntubeApp {
                         );
                     } else if self.stream_status.total_bytes_received > 0 {
                         let memory_text =
-                            format!("Mem: {}", self.format_file_size(self.current_memory_usage));
+                            format!("Mem: {}", self.format_data_size(self.current_memory_usage));
                         ui.label(
                             egui::RichText::new(memory_text)
                                 .size(10.0)
@@ -484,26 +484,51 @@ impl AntubeApp {
         let mut buffer = Vec::new();
         let mut chunk_count = 0;
         const PREBUFFER_SIZE: usize = 40 * 1024 * 1024; // 40MB
+        let mut video_streamer: Option<VideoStreamer> = None;
+        let mut playback_started = false;
 
         println!(
-            "Starting prebuffering - will collect {}MB before creating video pipeline",
+            "Starting prebuffering - will collect up to {}MB before starting video pipeline",
             PREBUFFER_SIZE / (1024 * 1024)
         );
 
-        // First phase: collect all data
         for chunk_result in stream {
             let chunk = chunk_result?;
             chunk_count += 1;
 
             Self::save_chunk_for_testing(&chunk);
-            buffer.extend_from_slice(&chunk);
 
-            println!(
-                "Prebuffering: collected chunk {} ({} bytes), total: {}MB",
-                chunk_count,
-                chunk.len(),
-                buffer.len() / (1024 * 1024)
-            );
+            if !playback_started {
+                // First phase: collect data until we have enough for reliable format detection
+                buffer.extend_from_slice(&chunk);
+                println!(
+                    "Prebuffering: collected chunk {} ({} bytes), total: {}MB",
+                    chunk_count,
+                    chunk.len(),
+                    buffer.len() / (1024 * 1024)
+                );
+
+                // Start playback once we hit 40MB OR when we have all the data (whichever comes first)
+                if buffer.len() >= PREBUFFER_SIZE {
+                    println!("✅ Reached 40MB prebuffer limit! Creating video pipeline and starting playback");
+
+                    // Create pipeline and start playback
+                    let streamer = VideoStreamer::new()
+                        .map_err(|e| format!("Failed to create video streamer: {}", e))?;
+
+                    println!("VideoStreamer created, pushing initial buffer of {}MB", buffer.len() / (1024 * 1024));
+                    Self::push_chunk_to_streamer(&buffer, &streamer)?;
+
+                    video_streamer = Some(streamer);
+                    playback_started = true;
+                    buffer.clear(); // Free the buffer memory
+                }
+            } else {
+                // Second phase: continue streaming remaining chunks to the pipeline
+                if let Some(ref streamer) = video_streamer {
+                    Self::push_chunk_to_streamer(&chunk, streamer)?;
+                }
+            }
 
             if stream_tx
                 .send(StreamEvent::ChunkReceived { size: chunk.len() })
@@ -513,26 +538,30 @@ impl AntubeApp {
             }
         }
 
-        println!("✅ Data collection complete! Creating video pipeline and starting playback with {}MB of data",
-                buffer.len() / (1024 * 1024));
+        // Handle case where total file size is less than PREBUFFER_SIZE
+        if !playback_started && !buffer.is_empty() {
+            println!("✅ File smaller than 40MB - creating video pipeline with {}MB of data",
+                    buffer.len() / (1024 * 1024));
 
-        // Second phase: create pipeline and start playback
-        let video_streamer =
-            VideoStreamer::new().map_err(|e| format!("Failed to create video streamer: {}", e))?;
+            let streamer = VideoStreamer::new()
+                .map_err(|e| format!("Failed to create video streamer: {}", e))?;
 
-        println!("VideoStreamer created, pushing complete buffer");
-        Self::push_chunk_to_streamer(&buffer, &video_streamer)?;
-
-        println!("Buffer pushed, signaling end of stream");
-        if let Err(e) = video_streamer.signal_end_of_stream() {
-            return Err(format!("Failed to signal end of stream: {e}"));
+            Self::push_chunk_to_streamer(&buffer, &streamer)?;
+            video_streamer = Some(streamer);
         }
 
-        println!("End of stream signaled successfully");
+        // Signal end of stream
+        if let Some(ref streamer) = video_streamer {
+            println!("All chunks processed, signaling end of stream");
+            if let Err(e) = streamer.signal_end_of_stream() {
+                return Err(format!("Failed to signal end of stream: {e}"));
+            }
+            println!("End of stream signaled successfully");
 
-        // Keep the pipeline alive for playback
-        println!("Keeping pipeline alive for playback - press Ctrl+C to exit");
-        std::thread::sleep(std::time::Duration::from_secs(120)); // Keep alive for 2 minutes
+            // Keep the pipeline alive for playback
+            println!("Keeping pipeline alive for playback - press Ctrl+C to exit");
+            std::thread::sleep(std::time::Duration::from_secs(120)); // Keep alive for 2 minutes
+        }
 
         Ok(())
     }
@@ -628,7 +657,7 @@ impl AntubeApp {
                                     ui.label(
                                         egui::RichText::new(format!(
                                             "{} received",
-                                            self.format_file_size(
+                                            self.format_data_size(
                                                 self.stream_status.total_bytes_received
                                             )
                                         ))
@@ -659,7 +688,7 @@ impl AntubeApp {
                                 ui.label(
                                     egui::RichText::new(format!(
                                         "Memory usage: {}",
-                                        self.format_file_size(self.current_memory_usage)
+                                        self.format_data_size(self.current_memory_usage)
                                     ))
                                     .color(egui::Color32::GRAY)
                                     .size(18.0),
@@ -713,7 +742,7 @@ impl AntubeApp {
         }
     }
 
-    fn format_file_size(&self, bytes: usize) -> String {
+    fn format_data_size(&self, bytes: usize) -> String {
         const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
         let mut size = bytes as f64;
         let mut unit_index = 0;
