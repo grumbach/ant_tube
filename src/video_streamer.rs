@@ -29,7 +29,7 @@ struct PipelineElements {
 pub struct VideoStreamer {
     appsrc: gst_app::AppSrc,
     #[allow(dead_code)]
-    pipeline: gst::Pipeline,  // Kept for potential future use
+    pipeline: gst::Pipeline, // Kept for potential future use
     is_eos: AtomicBool,
 }
 
@@ -223,10 +223,7 @@ impl VideoStreamer {
         });
     }
 
-    fn handle_bus_message(
-        msg: &gst::Message,
-        pipeline_weak: &gst::glib::WeakRef<gst::Pipeline>,
-    ) {
+    fn handle_bus_message(msg: &gst::Message, pipeline_weak: &gst::glib::WeakRef<gst::Pipeline>) {
         use gst::MessageView;
         match msg.view() {
             MessageView::StateChanged(state_changed) => {
@@ -291,10 +288,7 @@ impl VideoStreamer {
                         || element_name.contains("audiosink")
                         || element_name.contains("decodebin")
                     {
-                        println!(
-                            "Critical pipeline element error: {}",
-                            element_name
-                        );
+                        println!("Critical pipeline element error: {}", element_name);
                     }
                 }
             }
@@ -379,7 +373,6 @@ impl VideoStreamer {
             .map_err(|e| format!("Failed to signal end of stream: {:?}", e))
             .map(|_| ())
     }
-
 }
 
 // Drop implementation removed to prevent blocking during application shutdown

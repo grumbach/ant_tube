@@ -45,8 +45,6 @@ enum StreamStatus {
     Streaming {
         total_bytes_received: usize,
         chunks_received: usize,
-        chunks_processed: usize,
-        chunks_in_memory: usize,
         last_update_time: std::time::Instant,
         total_size: usize,
     },
@@ -60,11 +58,25 @@ enum StreamStatus {
 }
 
 enum StreamEvent {
-    ServerConnected { stream_id: StreamId, total_size: usize },
-    ChunkReceived { stream_id: StreamId, size: usize },
-    StreamComplete { stream_id: StreamId, video_streamer: VideoStreamer },
-    StreamError { stream_id: StreamId, error: String },
-    VideoStreamerReady { stream_id: StreamId },
+    ServerConnected {
+        stream_id: StreamId,
+        total_size: usize,
+    },
+    ChunkReceived {
+        stream_id: StreamId,
+        size: usize,
+    },
+    StreamComplete {
+        stream_id: StreamId,
+        video_streamer: VideoStreamer,
+    },
+    StreamError {
+        stream_id: StreamId,
+        error: String,
+    },
+    VideoStreamerReady {
+        stream_id: StreamId,
+    },
 }
 
 struct AntubeApp {
@@ -137,17 +149,18 @@ impl eframe::App for AntubeApp {
         // Process stream events
         while let Ok(event) = self.stream_receiver.try_recv() {
             match event {
-                StreamEvent::ServerConnected { stream_id, total_size } => {
+                StreamEvent::ServerConnected {
+                    stream_id,
+                    total_size,
+                } => {
                     if let Some(stream) = self.streams.get_mut(&stream_id) {
                         stream.status = StreamStatus::Streaming {
                             total_bytes_received: 0,
                             chunks_received: 0,
-                            chunks_processed: 0,
-                            chunks_in_memory: 0,
                             last_update_time: std::time::Instant::now(),
                             total_size,
                         };
-                        println!("Stream {} connected, total size: {} bytes", stream_id, total_size);
+                        println!("Stream {stream_id} connected, total size: {total_size} bytes");
                     }
                 }
                 StreamEvent::ChunkReceived { stream_id, size } => {
@@ -155,8 +168,6 @@ impl eframe::App for AntubeApp {
                         if let StreamStatus::Streaming {
                             total_bytes_received,
                             chunks_received,
-                            chunks_processed,
-                            chunks_in_memory,
                             last_update_time,
                             total_size: _,
                         } = &mut stream.status
@@ -164,25 +175,17 @@ impl eframe::App for AntubeApp {
                             *chunks_received += 1;
                             *total_bytes_received += size;
 
-                            // Estimate chunks processed (assume 1MB chunk size for now)
-                            *chunks_processed = *total_bytes_received / (1024 * 1024);
-
-                            // Estimate chunks in memory (prebuffer + processing pipeline)
-                            // For streaming: keep about 40-50MB in memory (40-50 chunks)
-                            *chunks_in_memory = if *chunks_received <= 45 {
-                                *chunks_received
-                            } else {
-                                45 // Max chunks kept in memory during streaming
-                            };
-
                             *last_update_time = std::time::Instant::now();
                         }
                     }
                 }
                 StreamEvent::VideoStreamerReady { stream_id } => {
-                    println!("Stream {} video streamer ready", stream_id);
+                    println!("Stream {stream_id} video streamer ready");
                 }
-                StreamEvent::StreamComplete { stream_id, video_streamer } => {
+                StreamEvent::StreamComplete {
+                    stream_id,
+                    video_streamer,
+                } => {
                     if let Some(stream) = self.streams.get_mut(&stream_id) {
                         if let StreamStatus::Streaming {
                             total_bytes_received,
@@ -196,14 +199,14 @@ impl eframe::App for AntubeApp {
                             };
                             // Store the VideoStreamer to keep it alive
                             self.video_streamers.insert(stream_id, video_streamer);
-                            println!("Stream {} completed and VideoStreamer stored", stream_id);
+                            println!("Stream {stream_id} completed and VideoStreamer stored");
                         }
                     }
                 }
                 StreamEvent::StreamError { stream_id, error } => {
                     if let Some(stream) = self.streams.get_mut(&stream_id) {
                         stream.status = StreamStatus::Error { message: error };
-                        println!("Stream {} error", stream_id);
+                        println!("Stream {stream_id} error");
                     }
                 }
             }
@@ -219,7 +222,7 @@ impl eframe::App for AntubeApp {
         }
 
         for stream_id in finished_tasks {
-            println!("Cleaning up finished streaming task {}", stream_id);
+            println!("Cleaning up finished streaming task {stream_id}");
             self.stream_tasks.remove(&stream_id);
             // Note: Keep VideoStreamer alive even after task finishes - user might still be watching
         }
@@ -371,8 +374,6 @@ impl AntubeApp {
             StreamStatus::Streaming {
                 total_bytes_received,
                 chunks_received,
-                chunks_processed,
-                chunks_in_memory,
                 total_size,
                 ..
             } => {
@@ -392,21 +393,17 @@ impl AntubeApp {
 
                     ui.label(
                         egui::RichText::new(progress_text)
-                        .size(11.0)
-                        .color(egui::Color32::WHITE),
+                            .size(11.0)
+                            .color(egui::Color32::WHITE),
                     );
 
                     // Show detailed chunk processing stats
-                    let chunk_stats_text = format!(
-                        "• {} chunks processed • {} still in memory",
-                        chunks_processed,
-                        chunks_in_memory
-                    );
+                    let chunk_stats_text = format!("• {chunks_received} chunks processed");
 
                     ui.label(
                         egui::RichText::new(chunk_stats_text)
-                        .size(11.0)
-                        .color(egui::Color32::GRAY),
+                            .size(11.0)
+                            .color(egui::Color32::GRAY),
                     );
                 });
             }
@@ -541,15 +538,27 @@ impl AntubeApp {
 
         // Get total file size from DataStream
         let total_size = data_stream.data_size() as usize;
-        println!("Total file size: {} bytes ({:.1} MB)", total_size, total_size as f64 / (1024.0 * 1024.0));
+        println!(
+            "Total file size: {} bytes ({:.1} MB)",
+            total_size,
+            total_size as f64 / (1024.0 * 1024.0)
+        );
 
         // Send ServerConnected event with total size
-        let _ = stream_tx.send(StreamEvent::ServerConnected { stream_id, total_size });
+        let _ = stream_tx.send(StreamEvent::ServerConnected {
+            stream_id,
+            total_size,
+        });
 
         // Convert DataStream to iterator for processing
         let stream_iter = data_stream.map(|chunk_result| chunk_result.map_err(|e| e.to_string()));
 
-        if let Err(e) = Self::process_stream_with_delayed_pipeline(stream_id, stream_iter, total_size, &stream_tx) {
+        if let Err(e) = Self::process_stream_with_delayed_pipeline(
+            stream_id,
+            stream_iter,
+            total_size,
+            &stream_tx,
+        ) {
             let _ = stream_tx.send(StreamEvent::StreamError {
                 stream_id,
                 error: e,
@@ -566,7 +575,7 @@ impl AntubeApp {
         stream_tx: &mpsc::UnboundedSender<StreamEvent>,
     ) -> Result<(), String> {
         let mut buffer = Vec::new();
-        const PREBUFFER_SIZE: usize = 40 * 1024 * 1024; // 40MB
+        const PREBUFFER_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
         let mut video_streamer: Option<VideoStreamer> = None;
 
@@ -592,9 +601,9 @@ impl AntubeApp {
                     );
                 }
 
-                // Start playback once we hit 40MB OR when we have all the data (whichever comes first)
+                // Start playback once we hit PREBUFFER_SIZE OR when we have all the data (whichever comes first)
                 if buffer.len() >= PREBUFFER_SIZE {
-                    println!("✅ Reached 40MB prebuffer limit! Creating video pipeline and starting playback");
+                    println!("✅ Reached {PREBUFFER_SIZE}MB prebuffer limit! Creating video pipeline and starting playback");
 
                     // Create pipeline and start playback
                     let streamer = VideoStreamer::new()
@@ -634,7 +643,7 @@ impl AntubeApp {
         // Handle case where total file size is less than PREBUFFER_SIZE
         if !playback_started && !buffer.is_empty() {
             println!(
-                "✅ File smaller than 40MB - creating video pipeline with {}MB of data",
+                "✅ File smaller than {PREBUFFER_SIZE}MB - creating video pipeline with {}MB of data",
                 buffer.len() / (1024 * 1024)
             );
 
@@ -660,7 +669,7 @@ impl AntubeApp {
             // Send completion event to UI with VideoStreamer to keep it alive
             let _ = stream_tx.send(StreamEvent::StreamComplete {
                 stream_id,
-                video_streamer: streamer
+                video_streamer: streamer,
             });
             println!("StreamComplete event sent to UI with VideoStreamer");
         }
@@ -729,7 +738,7 @@ async fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("AnTube - Autonomi Video Streamer")
+            .with_title("AnTube")
             .with_inner_size([800.0, 600.0]),
         ..Default::default()
     };

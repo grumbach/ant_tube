@@ -5,8 +5,7 @@ A real-time video (mp4) streaming application using GStreamer for the Autonomi n
 ## Features
 
 - **Real-time streaming**: Video plays as chunks arrive (no disk buffering)
-- **Memory efficient**: Maximum 50MB memory usage with circular buffer
-- **Chunk-based**: Processes 4MB chunks efficiently
+- **Memory efficient**: Maximum 50MB kept in memory at a time
 - **Multiple networks**: Supports local, autonomi, and alpha environments
 
 ## Usage

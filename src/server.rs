@@ -19,10 +19,7 @@ impl Server {
         Ok(Self { client })
     }
 
-    pub async fn stream_data(
-        &self,
-        address: &str,
-    ) -> Result<autonomi::data::DataStream, String> {
+    pub async fn stream_data(&self, address: &str) -> Result<autonomi::data::DataStream, String> {
         println!("Starting to stream data from address: {address}");
 
         // Parse the address
