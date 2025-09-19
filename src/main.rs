@@ -727,6 +727,21 @@ impl AntubeApp {
     }
 }
 
+fn load_icon() -> egui::IconData {
+    let image_bytes = include_bytes!("../assets/antube.png");
+    let decoded = image::load_from_memory(image_bytes)
+        .expect("Failed to load PNG")
+        .into_rgba8();
+    let (width, height) = decoded.dimensions();
+    let rgba_bytes = decoded.into_raw();
+
+    egui::IconData {
+        rgba: rgba_bytes,
+        width,
+        height,
+    }
+}
+
 #[tokio::main]
 async fn main() -> eframe::Result<()> {
     let args = Args::parse();
@@ -739,7 +754,8 @@ async fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("AnTube")
-            .with_inner_size([800.0, 600.0]),
+            .with_inner_size([800.0, 600.0])
+            .with_icon(load_icon()),
         ..Default::default()
     };
 
